@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
 
-from app.core.store import create_environment, get_environment, stop_environment
+from app.core.store import create_environment, get_environment, stop_environment, update_environment
 from app.schemas.common import ApiEnvelope
 from app.schemas.environment import SyntheticEnvironment, SyntheticEnvironmentRequest
 
@@ -45,3 +45,22 @@ async def stop_environment_endpoint(environment_id: str) -> ApiEnvelope[Syntheti
 
     updated = stop_environment(environment_id)
     return ApiEnvelope(success=True, data=updated)
+
+
+@router.post("/environments/{environment_id}/ready", response_model=ApiEnvelope[SyntheticEnvironment])
+def mark_environment_ready(environment_id: str) -> ApiEnvelope[SyntheticEnvironment]:
+    env = get_environment(environment_id)
+    if not env:
+        raise HTTPException(
+            status_code=404,
+            detail={"message": f"Environment '{environment_id}' was not found."}
+        )
+
+    env.status = "ready"
+    update_environment(env)
+
+    return ApiEnvelope(
+        success=True,
+        data=env,
+        error=None
+    )
