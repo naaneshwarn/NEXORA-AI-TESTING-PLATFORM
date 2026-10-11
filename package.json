@@ -1,0 +1,16 @@
+{
+  "name": "nexora-ai-testing-platform",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "npm run build --workspace @nexora/shared && npm run dev --workspace @nexora/web",
+    "dev:api": "npm run build --workspace @nexora/shared && npm run dev --workspace @nexora/api",
+    "build": "npm run build --workspace @nexora/shared && npm run build --workspace @nexora/api && npm run build --workspace @nexora/web",
+    "test": "npm run test --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  }
+}

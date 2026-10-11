@@ -1,0 +1,36 @@
+# Node / frontend
+node_modules/
+dist/
+.vite/
+coverage/
+.npm/
+*.tsbuildinfo
+npm-debug.log*
+
+# Python / FastAPI
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Env and secrets
+.env
+.env.*
+!.env.example
+
+# General
+.DS_Store
+Thumbs.db
+*.log
+*.db
+*.sqlite
+*.sqlite3
+*.tmp
+*.temp
+
+# Generated artefacts
+build/
+out/
