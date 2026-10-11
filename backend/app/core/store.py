@@ -94,11 +94,16 @@ def get_environment(environment_id: str) -> SyntheticEnvironment | None:
     return ENVIRONMENTS.get(environment_id)
 
 
+def update_environment(env: SyntheticEnvironment) -> SyntheticEnvironment:
+    env.updated_at = utc_now()
+    ENVIRONMENTS[env.environment_id] = env
+    return env
+
+
 def stop_environment(environment_id: str) -> SyntheticEnvironment:
     env = ENVIRONMENTS[environment_id]
     env.status = "stopped"
-    env.updated_at = utc_now()
-    return env
+    return update_environment(env)
 
 
 def submit_evaluation(payload: EvaluationSubmission) -> ReportSummary:
@@ -118,3 +123,21 @@ def submit_evaluation(payload: EvaluationSubmission) -> ReportSummary:
 
 def get_report(report_id: str) -> ReportSummary | None:
     return REPORTS.get(report_id)
+
+
+class Store:
+    get_environment = get_environment
+    update_environment = update_environment
+    create_environment = create_environment
+    stop_environment = stop_environment
+    register_agent = register_agent
+    get_agent = get_agent
+    create_test_run = create_test_run
+    get_test_run = get_test_run
+    cancel_test_run = cancel_test_run
+    get_events_for_run = get_events_for_run
+    submit_evaluation = submit_evaluation
+    get_report = get_report
+
+
+store = Store()
