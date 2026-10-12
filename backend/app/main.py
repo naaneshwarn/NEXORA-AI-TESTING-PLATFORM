@@ -36,3 +36,7 @@ app.include_router(evaluation_router, prefix=settings.api_prefix)
 @app.get("/health")
 async def root_health() -> dict[str, str]:
     return {"status": "ok", "service": settings.app_name.lower()}
+
+from app.api.routes.crm import router as crm_router
+
+app.include_router(crm_router, prefix=settings.api_prefix)

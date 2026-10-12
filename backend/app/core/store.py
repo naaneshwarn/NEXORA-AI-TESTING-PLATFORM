@@ -125,6 +125,41 @@ def get_report(report_id: str) -> ReportSummary | None:
     return REPORTS.get(report_id)
 
 
+# CRM Leads state
+CRM_LEADS: dict[str, dict] = {}
+
+
+def create_crm_lead(lead_data: dict) -> dict:
+    from uuid import uuid4
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    lead_id = 'lead-' + uuid4().hex[:8]
+    lead = {**lead_data, 'id': lead_id, 'created_at': now, 'updated_at': None}
+    CRM_LEADS[lead_id] = lead
+    return lead
+
+
+def get_crm_lead(lead_id: str) -> dict | None:
+    return CRM_LEADS.get(lead_id)
+
+
+def list_crm_leads() -> list[dict]:
+    return list(CRM_LEADS.values())
+
+
+def update_crm_lead(lead_id: str, lead_data: dict) -> dict:
+    from datetime import datetime, timezone
+    existing = CRM_LEADS[lead_id]
+    now = datetime.now(timezone.utc).isoformat()
+    updated = {**existing, **lead_data, 'updated_at': now}
+    CRM_LEADS[lead_id] = updated
+    return updated
+
+
+def delete_crm_lead(lead_id: str) -> None:
+    CRM_LEADS.pop(lead_id, None)
+
+
 class Store:
     get_environment = get_environment
     update_environment = update_environment
@@ -138,6 +173,17 @@ class Store:
     get_events_for_run = get_events_for_run
     submit_evaluation = submit_evaluation
     get_report = get_report
+    create_crm_lead = create_crm_lead
+    get_crm_lead = get_crm_lead
+    list_crm_leads = list_crm_leads
+    update_crm_lead = update_crm_lead
+    delete_crm_lead = delete_crm_lead
 
 
 store = Store()
+
+
+
+
+
+
