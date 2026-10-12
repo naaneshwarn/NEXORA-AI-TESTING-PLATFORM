@@ -14,6 +14,7 @@ TEST_RUNS: dict[str, RunDetail] = {}
 ENVIRONMENTS: dict[str, SyntheticEnvironment] = {}
 EVENTS: dict[str, list[ExecutionEvent]] = {}
 REPORTS: dict[str, ReportSummary] = {}
+TOOL_TRACES: dict[str, list[dict]] = {}
 
 
 def utc_now() -> datetime:
@@ -80,6 +81,17 @@ def cancel_test_run(run_id: str) -> RunDetail:
 
 def get_events_for_run(run_id: str) -> list[ExecutionEvent]:
     return EVENTS.get(run_id, [])
+
+
+def record_tool_trace(run_id: str, trace_data: dict) -> dict:
+    """Append a tool-call trace for a run, stamping it with a UTC timestamp."""
+    trace = {**trace_data, "run_id": run_id, "timestamp": utc_now().isoformat()}
+    TOOL_TRACES.setdefault(run_id, []).append(trace)
+    return trace
+
+
+def get_traces_for_run(run_id: str) -> list[dict]:
+    return TOOL_TRACES.get(run_id, [])
 
 
 def create_environment(payload: SyntheticEnvironment) -> SyntheticEnvironment:
@@ -171,6 +183,8 @@ class Store:
     get_test_run = get_test_run
     cancel_test_run = cancel_test_run
     get_events_for_run = get_events_for_run
+    record_tool_trace = record_tool_trace
+    get_traces_for_run = get_traces_for_run
     submit_evaluation = submit_evaluation
     get_report = get_report
     create_crm_lead = create_crm_lead
