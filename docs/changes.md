@@ -2,7 +2,7 @@
 
 ## 1. Branch & Context
 - **Branch**: `feature/synthetic-api`
-- **Latest Commit**: `872a7d5` (*feat(tracing): verify live protocol execution dispatcher and redacted tool-call telemetry*)
+- **Latest Commit**: `507c6d2` (*feat(crm): implement comprehensive CRM tests, protocol execution, and redacted tracing*)
 - **Upstream Base**: `25dab08` (*Publish NEXORA AI Testing Platform source code*)
 - **Date**: October 13, 2026
 - **Focus**:
@@ -11,9 +11,11 @@
   3. Deterministic fault simulation and latency injection on CRM read endpoints (`simulated_latency_ms`, `inject_error`).
   4. Protocol adapters for agent communication (`REST`, `OpenAI`, `LangChain`) via `/synthetic/agent/execute/{protocol}`.
   5. Agent profiling, tool-call telemetry with sensitive data redaction, and run trace retrieval (`/test-runs/{run_id}/traces`).
-  6. Comprehensive automated test suite expansion (25 tests passing across 5 modules) and end-to-end integration verification.
+  6. Comprehensive automated test suite expansion (38 tests passing across 7 modules) and end-to-end integration verification.
   7. Execution event-system integration for profiled tool calls (`tool_call` events on `/test-runs/{run_id}/events`).
   8. Focused synthetic CRM contract coverage (`tests/test_crm.py`, 5 tests) for CRUD, validation, 404 envelopes, query boundaries, and repeated operations.
+  9. Optional authentication dependency (`backend/app/core/auth.py`) accepting `X-API-Key` / `Authorization: Bearer` with deterministic 401/403 simulation sentinels for denied-access testing, attached to the CRM and synthetic execution routers.
+  10. Server-Sent Events (SSE) live trace streaming (`GET /api/v1/test-runs/{run_id}/stream`) emitting deduplicated `tool_trace` frames and a terminal `run_status` frame.
 
 ---
 
@@ -99,6 +101,32 @@
     - Persists traces when `run_id` is provided; still times and formats execution when `run_id` is `None`.
 - **Trace Retrieval Endpoint (`backend/app/api/routes/test_runs.py`)**:
   - `GET /api/v1/test-runs/{run_id}/traces`: Returns `ApiEnvelope[list[ToolCallTraceResponse]]`; raises `404 Not Found` if no traces exist for the run.
+
+### G. Optional Authentication Dependency
+- **Auth Helper (`backend/app/core/auth.py`)**:
+  - `api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)` and `bearer_scheme = HTTPBearer(auto_error=False)` allow credentials to be supplied optionally without FastAPI auto-rejecting anonymous callers.
+  - `verify_optional_auth(api_key, bearer)`: Resolves the effective token with Bearer precedence, then returns `{"authenticated": bool(token), "token_prefix": token[:4] + "..."}` (or `None` when anonymous).
+  - Deterministic denied-access sentinels: `INVALID_TOKEN = "invalid-token-test"` raises `401 Unauthorized`, and `FORBIDDEN_TOKEN = "forbidden-token-test"` raises `403 Forbidden`, each wrapped in the standard `{"message": ...}` detail envelope.
+  - Designed to be attached via `Depends(verify_optional_auth)` / router `dependencies=[...]` on any synthetic surface; it never blocks anonymous traffic unless a sentinel is presented.
+- **Route Integration (`backend/app/api/routes/crm.py`, `backend/app/api/routes/agent_execution.py`)**:
+  - Every CRM route (`POST`/`GET`/`GET {id}`/`PUT`/`DELETE` on `/leads`) now declares `auth_info: dict = Depends(verify_optional_auth)` alongside its existing parameters.
+  - `POST /synthetic/agent/execute/{protocol}` declares the same dependency, so both synthetic surfaces share identical optional-auth semantics.
+  - Anonymous calls remain `200`/`201`/`204`, while `X-API-Key: invalid-token-test` and `Authorization: Bearer forbidden-token-test` are rejected with the standard `401` / `403` error envelopes before any handler logic runs.
+
+### H. SSE Live Trace Streaming
+- **Streaming Router (`backend/app/api/routes/streaming.py`)**:
+  - `APIRouter(prefix="/test-runs", tags=["streaming"])` exposing `GET /{run_id}/stream` (mounted as `/api/v1/test-runs/{run_id}/stream`).
+  - Validates the run via `get_test_run(run_id)` and raises the structured `404` envelope before opening a stream.
+  - Returns `EventSourceResponse` (from `sse_starlette.sse`) wrapping an async `_event_stream` generator.
+  - Polls `get_traces_for_run(run_id)` every `POLL_INTERVAL_SECONDS = 1.0` (non-blocking `asyncio.sleep`) and yields `"event": "tool_trace"` frames with `json.dumps(..., default=str)` payloads.
+  - De-duplicates traces with a stable `call_id:timestamp` key tracked in an in-memory `sent` set (also used as the SSE `id`).
+  - Treats `{"completed", "failed", "cancelled", "passed"}` as terminal: emits a final `"event": "run_status"` frame (`run_id`, `state`, `message`, `completed_at`) and closes the stream.
+  - Observes `await request.is_disconnected()` each iteration for graceful client-disconnect cleanup.
+  - Reuses the optional auth dependency (`Depends(verify_optional_auth)`), so streaming is anonymously reachable while the synthetic 401/403 sentinels still apply.
+- **Application Registration (`backend/app/main.py`)**:
+  - Mounted `streaming_router` under `settings.api_prefix` (`/api/v1`).
+- **Dependencies (`backend/requirements.txt`)**:
+  - Pinned `sse-starlette==2.1.3` and `starlette==0.41.3` (the newer `sse-starlette` 3.x pulls a Starlette that conflicts with `fastapi==0.115.6`).
 
 ---
 
@@ -209,14 +237,167 @@ diff --git a/backend/app/api/routes/test_runs.py b/backend/app/api/routes/test_r
 +    return ApiEnvelope(success=True, data=traces)
 ```
 
+### D. Optional Authentication Dependency
+```diff
+diff --git a/backend/app/core/auth.py b/backend/app/core/auth.py
+--- /dev/null
++++ b/backend/app/core/auth.py
+@@ -0,0 +1,42 @@
++from __future__ import annotations
++
++from fastapi import HTTPException, Security, status
++from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
++
++api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
++bearer_scheme = HTTPBearer(auto_error=False)
++
++INVALID_TOKEN = "invalid-token-test"
++FORBIDDEN_TOKEN = "forbidden-token-test"
++
++
++async def verify_optional_auth(
++    api_key: str | None = Security(api_key_header),
++    bearer: HTTPAuthorizationCredentials | None = Security(bearer_scheme),
++) -> dict:
++    token = bearer.credentials if bearer else api_key
++
++    if token == INVALID_TOKEN:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail={"message": "Invalid authentication credentials provided."},
++        )
++
++    if token == FORBIDDEN_TOKEN:
++        raise HTTPException(
++            status_code=status.HTTP_403_FORBIDDEN,
++            detail={"message": "Access denied for this synthetic resource."},
++        )
++
++    return {
++        "authenticated": bool(token),
++        "token_prefix": token[:4] + "..." if token else None,
++    }
+```
+
+The dependency is then attached to the synthetic routers:
+```diff
+diff --git a/backend/app/api/routes/crm.py b/backend/app/api/routes/crm.py
+--- a/backend/app/api/routes/crm.py
++++ b/backend/app/api/routes/crm.py
+@@ -3,9 +3,10 @@
+ import asyncio
+ from typing import Annotated
+ 
+-from fastapi import APIRouter, HTTPException, Query
++from fastapi import APIRouter, Depends, HTTPException, Query
+ 
++from app.core.auth import verify_optional_auth
+ from app.core.store import (
+@@ -68,6 +69,7 @@
+ async def list_leads_endpoint(
+     simulated_latency_ms: SimulatedLatencyMs = None,
+     inject_error: InjectError = None,
++    auth_info: dict = Depends(verify_optional_auth),
+ ) -> ApiEnvelope[list[CRMLeadResponse]]:
+     await _apply_fault_injection(simulated_latency_ms, inject_error)
+     leads = list_crm_leads()
+
+diff --git a/backend/app/api/routes/agent_execution.py b/backend/app/api/routes/agent_execution.py
+--- a/backend/app/api/routes/agent_execution.py
++++ b/backend/app/api/routes/agent_execution.py
+@@ -30,6 +30,7 @@
+ async def execute_agent_tool_endpoint(
+     protocol: str,
+     run_id: str | None = Query(default=None, description="Test run to attach tool-call telemetry to."),
+     payload: dict[str, Any] | None = Body(default=None),
++    auth_info: dict = Depends(verify_optional_auth),
+ ) -> dict[str, Any]:
+```
+
+### E. SSE Live Trace Streaming
+```diff
+diff --git a/backend/app/api/routes/streaming.py b/backend/app/api/routes/streaming.py
+--- /dev/null
++++ b/backend/app/api/routes/streaming.py
+@@ -0,0 +1,86 @@
++from __future__ import annotations
++
++import asyncio
++import json
++from collections.abc import AsyncIterator
++from typing import Any
++
++from fastapi import APIRouter, Depends, HTTPException, Request
++from sse_starlette.sse import EventSourceResponse
++
++from app.core.auth import verify_optional_auth
++from app.core.store import get_test_run, get_traces_for_run
++
++router = APIRouter(prefix="/test-runs", tags=["streaming"])
++
++TERMINAL_STATES: frozenset[str] = frozenset({"completed", "failed", "cancelled", "passed"})
++TRACE_EVENT = "tool_trace"
++STATUS_EVENT = "run_status"
++POLL_INTERVAL_SECONDS = 1.0
++
++
++def _trace_key(trace: dict[str, Any]) -> str:
++    return f"{trace.get('call_id')}:{trace.get('timestamp')}"
++
++
++async def _event_stream(request: Request, run_id: str) -> AsyncIterator[dict[str, Any]]:
++    sent: set[str] = set()
++
++    while True:
++        if await request.is_disconnected():
++            break
++
++        for trace in get_traces_for_run(run_id):
++            key = _trace_key(trace)
++            if key in sent:
++                continue
++            sent.add(key)
++            yield {"event": TRACE_EVENT, "id": key, "data": json.dumps(trace, default=str)}
++
++        run = get_test_run(run_id)
++        if run is None or run.state in TERMINAL_STATES:
++            yield {"event": STATUS_EVENT, "data": json.dumps(_status_payload(run), default=str)}
++            break
++
++        await asyncio.sleep(POLL_INTERVAL_SECONDS)
++
++
++@router.get("/{run_id}/stream")
++async def stream_test_run(
++    run_id: str,
++    request: Request,
++    auth_info: dict = Depends(verify_optional_auth),
++) -> EventSourceResponse:
++    if get_test_run(run_id) is None:
++        raise HTTPException(status_code=404, detail={"message": f"Test run '{run_id}' was not found."})
++    return EventSourceResponse(_event_stream(request, run_id))
++
+diff --git a/backend/app/main.py b/backend/app/main.py
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -40,6 +40,8 @@
+ from app.api.routes.agent_execution import router as agent_execution_router
+ from app.api.routes.crm import router as crm_router
++from app.api.routes.streaming import router as streaming_router
+ 
+ app.include_router(crm_router, prefix=settings.api_prefix)
+ app.include_router(agent_execution_router, prefix=settings.api_prefix)
++app.include_router(streaming_router, prefix=settings.api_prefix)
+```
+
 ---
 
 ## 4. Automated Test Suite Verification
 
 ### Test Results Overview
 - **Command**: `python -m pytest` (executed with `backend/.venv/Scripts/python.exe`)
-- **Total Tests**: **25 passed** (0 failures, 0 errors, 1 benign deprecation warning)
-- **Execution Time**: ~0.90s
+- **Total Tests**: **38 passed** (0 failures, 0 errors, 1 benign deprecation warning)
+- **Execution Time**: ~0.98s
 
 ### Detailed Test Module Breakdown
 | Test Module | Tests | Status | Coverage Areas |
@@ -226,8 +407,10 @@ diff --git a/backend/app/api/routes/test_runs.py b/backend/app/api/routes/test_r
 | `tests/test_protocol_adapters.py` | 7 | ✅ Passed | REST adapter round-trip, OpenAI function payload parsing & tool message formatting, `AdapterFactory` aliases & defaults, REST tool execution, OpenAI tool execution, error normalization on missing tools & invalid syntax, unknown protocol rejection |
 | `tests/test_tracing.py` | 8 | ✅ Passed | Recursive dictionary/list secret masking, Inline secret token scrubbing, Instrumented tool execution telemetry, Execution failure capturing, Dispatcher end-to-end trace persistence, Missing trace 404 handling, `tool_call` execution event emission (success & failure) |
 | `tests/test_crm.py` | 5 | ✅ Passed | CRM CRUD lifecycle & state changes, invalid payload rejection (422), structured 404 envelopes for missing leads, query-boundary validation for `inject_error` / `simulated_latency_ms`, repeated & concurrent operations |
+| `tests/test_auth.py` | 9 | ✅ Passed | Anonymous request allowance, `X-API-Key` acceptance & prefix, `Authorization: Bearer` acceptance, Bearer-over-API-key precedence, simulated `401` (invalid sentinel), simulated `403` (forbidden sentinel), plus real-route integration checks (anonymous CRM `200`, CRM `401`, execution `403`) |
+| `tests/test_streaming.py` | 4 | ✅ Passed | Unknown-run `404`, terminal-run `run_status` emission & stream close, deduplicated `tool_trace` frame ordering before `run_status` with redacted payloads, and auth-sentinel rejection on the stream route |
 
-> **Test isolation note:** as with the existing suites, the CRM module exercises the shared in-process in-memory store through a module-level `TestClient(app)`; assertions use generated unique IDs and are order-independent relative to other modules.
+> **Test isolation note:** as with the existing suites, the CRM module exercises the shared in-process in-memory store through a module-level `TestClient(app)`; assertions use generated unique IDs and are order-independent relative to other modules. The auth module verifies the dependency both through its own isolated `FastAPI()` app and against the real `app.main` routers with the synthetic sentinels. The streaming module drives each run to a terminal `cancelled` state so the SSE body is fully buffered, and resets `sse_starlette`'s process-global exit `Event` between tests (a library/`TestClient` event-loop artefact).
 
 ---
 
@@ -267,6 +450,23 @@ All major user journeys and service interactions were verified against live Fast
 5. `GET /api/v1/test-runs/{run_id}/traces` → `200 OK` (retrieves 2 recorded traces).
 6. Trace inspection verifies `parameters.api_key` was securely stored as `"[REDACTED]"`.
 
+### Cycle 6: Optional Authentication & Denied-Access Simulation
+1. An isolated FastAPI route guarded by `Depends(verify_optional_auth)` with no credentials → `200 OK` (`{"authenticated": false, "token_prefix": null}`).
+2. Same route with `X-API-Key: abcdef123456` → `200 OK` (`{"authenticated": true, "token_prefix": "abcd..."}`).
+3. Same route with `Authorization: Bearer tok12345` → `200 OK` (`{"authenticated": true, "token_prefix": "tok1..."}`).
+4. Same route with `X-API-Key: invalid-token-test` → `401 Unauthorized` (`"Invalid authentication credentials provided."`).
+5. Same route with `Authorization: Bearer forbidden-token-test` → `403 Forbidden` (`"Access denied for this synthetic resource."`).
+6. `GET /api/v1/leads` with no credentials → `200 OK` (CRM remains anonymously reachable).
+7. `GET /api/v1/leads` with `X-API-Key: invalid-token-test` → `401 Unauthorized` (rejected before fault injection or store access).
+8. `POST /api/v1/synthetic/agent/execute/rest` with `Authorization: Bearer forbidden-token-test` → `403 Forbidden`.
+
+### Cycle 7: SSE Live Trace Streaming
+1. `GET /api/v1/test-runs/run-does-not-exist/stream` → `404 Not Found` (structured envelope, no stream opened).
+2. `POST /api/v1/test-runs` → `201 Created`; `POST /api/v1/test-runs/{run_id}/cancel` → `200 OK`.
+3. `GET /api/v1/test-runs/{run_id}/stream` → `200 OK` (`text/event-stream`); stream yields a single `event: run_status` frame with `"state": "cancelled"`, then closes.
+4. On a run with a recorded tool call: `POST /api/v1/synthetic/agent/execute/rest?run_id={run_id}` → `200 OK`; after cancellation the stream emits exactly one `event: tool_trace` frame (redacted payload) followed by `event: run_status`.
+5. `GET /api/v1/test-runs/{run_id}/stream` with `Authorization: Bearer forbidden-token-test` → `403 Forbidden`.
+
 ---
 
 ## 6. Git Commit Log on `feature/synthetic-api`
@@ -277,18 +477,23 @@ All major user journeys and service interactions were verified against live Fast
 | `e7e26ee` | `feat(crm): implement stateful synthetic CRM routes with fault and latency injection` | CRM schemas, store operations, CRUD routes, `simulated_latency_ms` and `inject_error` fault simulation, 5 passing tests. |
 | `9a1d71a` | `feat(adapters): implement protocol adapter layer, tool registry, and agent execution dispatcher` | Unified models, `RESTProtocolAdapter`, `OpenAIFunctionAdapter`, `AdapterFactory`, `TOOL_REGISTRY`, `/synthetic/agent/execute/{protocol}` dispatcher, 12 passing tests. |
 | `872a7d5` | `feat(tracing): verify live protocol execution dispatcher and redacted tool-call telemetry` | Redaction utility (`redact_sensitive_data`), execution tracing wrapper (`execute_and_trace_tool`), `TOOL_TRACES` storage, `/test-runs/{run_id}/traces` endpoint, 18 passing tests. |
+| `507c6d2` | `feat(crm): implement comprehensive CRM tests, protocol execution, and redacted tracing` | Committed the event-system integration and focused CRM contract coverage; `tool_call` execution events, `tests/test_crm.py` (5 tests), 25 passing tests total. |
 
 ---
 
 ## 7. Uncommitted Working-Tree Changes
 
-Session-scoped changes (uncommitted; belong with Priority 1 & 2 work): wiring profiled tool executions into the existing event system and adding focused CRM contract coverage.
+Session-scoped changes (uncommitted; belong with Priority 1 & 2 work): the optional authentication dependency, its route integration, the SSE live trace streaming endpoint, and their contract coverage.
 
 | File | Change |
 | :--- | :--- |
-| `backend/app/core/store.py` | Added `record_execution_event(run_id, event)` (appends to the existing `EVENTS` store) and exposed it on the `Store` class alongside `get_events_for_run`. |
-| `backend/app/api/routes/agent_execution.py` | Validates `run_id` against `get_test_run` (404 envelope when unknown); after `execute_and_trace_tool`, emits a `tool_call` `ExecutionEvent` (sequence = current event count + 1) carrying only the redacted telemetry payload and a success/failed status. |
-| `backend/tests/test_tracing.py` | Added `test_execution_dispatcher_writes_tool_call_event_for_run` and `test_execution_dispatcher_writes_failure_tool_call_event` (8 total in module). |
-| `backend/tests/test_crm.py` | **New** module: 5 focused CRM contract tests (CRUD lifecycle, invalid payloads, 404 envelopes, query boundaries, repeated/concurrent operations). |
+| `backend/app/core/auth.py` | **New** module: `api_key_header` / `bearer_scheme` (`auto_error=False`), `verify_optional_auth(api_key, bearer)` with Bearer precedence, and the `INVALID_TOKEN` (401) / `FORBIDDEN_TOKEN` (403) denied-access sentinels. |
+| `backend/app/api/routes/crm.py` | Imported `Depends` / `verify_optional_auth` and added `auth_info: dict = Depends(verify_optional_auth)` to all five `/leads` endpoints. |
+| `backend/app/api/routes/agent_execution.py` | Added `auth_info: dict = Depends(verify_optional_auth)` to `POST /synthetic/agent/execute/{protocol}` (imports `Depends` and `verify_optional_auth`). |
+| `backend/app/api/routes/streaming.py` | **New** module: `EventSourceResponse`-backed `GET /test-runs/{run_id}/stream` that de-duplicates `tool_trace` frames by `call_id:timestamp`, watches for terminal run states, emits a final `run_status` frame, and honours client disconnects. |
+| `backend/app/main.py` | Mounted `streaming_router` under `settings.api_prefix`. |
+| `backend/requirements.txt` | Pinned `starlette==0.41.3` and `sse-starlette==2.1.3` (compatible with `fastapi==0.115.6`). |
+| `backend/tests/test_auth.py` | **New** module: 9 focused tests exercising the dependency through an isolated `FastAPI()` app (anonymous allowance, `X-API-Key`, Bearer, Bearer precedence, simulated 401 and 403) and against the real routers (anonymous CRM `200`, CRM `401`, execution `403`). |
+| `backend/tests/test_streaming.py` | **New** module: 4 SSE contract tests (unknown-run `404`, terminal `run_status`, deduplicated `tool_trace` ordering with redacted payload, auth-sentinel `403`) with an `sse_starlette` exit-`Event` reset fixture. |
 
-Result: **25 passed** (0 failures, 0 errors) in ~0.90s. Run with `backend/.venv/Scripts/python.exe -m pytest -v`. `docs/current-status.md` and this log were updated to match (uncommitted).
+Result: **38 passed** (0 failures, 0 errors) in ~0.98s. Run with `backend/.venv/Scripts/python.exe -m pytest -v`. `docs/current-status.md` and this log were updated to match (uncommitted).
