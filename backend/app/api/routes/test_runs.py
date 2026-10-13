@@ -2,10 +2,17 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException
 
-from app.core.store import cancel_test_run, create_test_run, get_events_for_run, get_test_run
+from app.core.store import (
+    cancel_test_run,
+    create_test_run,
+    get_events_for_run,
+    get_test_run,
+    get_traces_for_run,
+)
 from app.schemas.common import ApiEnvelope
 from app.schemas.events import ExecutionEvent
 from app.schemas.test_run import ExecutionStatus, RunCreateRequest, RunDetail
+from app.schemas.tracing import ToolCallTraceResponse
 
 router = APIRouter(tags=["test-runs"])
 
@@ -45,3 +52,11 @@ async def get_test_run_events_endpoint(run_id: str) -> ApiEnvelope[list[Executio
     if not events:
         raise HTTPException(status_code=404, detail={"message": f"No execution events were found for run '{run_id}'."})
     return ApiEnvelope(success=True, data=events)
+
+
+@router.get("/test-runs/{run_id}/traces", response_model=ApiEnvelope[list[ToolCallTraceResponse]])
+async def get_test_run_traces_endpoint(run_id: str) -> ApiEnvelope[list[ToolCallTraceResponse]]:
+    traces = get_traces_for_run(run_id)
+    if not traces:
+        raise HTTPException(status_code=404, detail={"message": f"No tool traces were found for run '{run_id}'."})
+    return ApiEnvelope(success=True, data=traces)
