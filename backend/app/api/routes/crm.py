@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
+from app.core.auth import verify_optional_auth
 from app.core.store import (
     create_crm_lead,
     delete_crm_lead,
@@ -59,7 +60,10 @@ async def _apply_fault_injection(
 
 
 @router.post("/leads", status_code=201, response_model=ApiEnvelope[CRMLeadResponse])
-async def create_lead_endpoint(payload: CRMLeadCreate) -> ApiEnvelope[CRMLeadResponse]:
+async def create_lead_endpoint(
+    payload: CRMLeadCreate,
+    auth_info: dict = Depends(verify_optional_auth),
+) -> ApiEnvelope[CRMLeadResponse]:
     lead_data = payload.model_dump()
     lead = create_crm_lead(lead_data)
     return ApiEnvelope(success=True, data=lead)
@@ -69,6 +73,7 @@ async def create_lead_endpoint(payload: CRMLeadCreate) -> ApiEnvelope[CRMLeadRes
 async def list_leads_endpoint(
     simulated_latency_ms: SimulatedLatencyMs = None,
     inject_error: InjectError = None,
+    auth_info: dict = Depends(verify_optional_auth),
 ) -> ApiEnvelope[list[CRMLeadResponse]]:
     await _apply_fault_injection(simulated_latency_ms, inject_error)
     leads = list_crm_leads()
@@ -80,6 +85,7 @@ async def get_lead_endpoint(
     lead_id: str,
     simulated_latency_ms: SimulatedLatencyMs = None,
     inject_error: InjectError = None,
+    auth_info: dict = Depends(verify_optional_auth),
 ) -> ApiEnvelope[CRMLeadResponse]:
     await _apply_fault_injection(simulated_latency_ms, inject_error)
     lead = get_crm_lead(lead_id)
@@ -89,7 +95,11 @@ async def get_lead_endpoint(
 
 
 @router.put("/leads/{lead_id}", response_model=ApiEnvelope[CRMLeadResponse])
-async def update_lead_endpoint(lead_id: str, payload: CRMLeadCreate) -> ApiEnvelope[CRMLeadResponse]:
+async def update_lead_endpoint(
+    lead_id: str,
+    payload: CRMLeadCreate,
+    auth_info: dict = Depends(verify_optional_auth),
+) -> ApiEnvelope[CRMLeadResponse]:
     if get_crm_lead(lead_id) is None:
         raise HTTPException(status_code=404, detail={"message": f"Lead '{lead_id}' was not found."})
     lead_data = payload.model_dump()
@@ -98,7 +108,10 @@ async def update_lead_endpoint(lead_id: str, payload: CRMLeadCreate) -> ApiEnvel
 
 
 @router.delete("/leads/{lead_id}", status_code=204)
-async def delete_lead_endpoint(lead_id: str):
+async def delete_lead_endpoint(
+    lead_id: str,
+    auth_info: dict = Depends(verify_optional_auth),
+):
     if get_crm_lead(lead_id) is None:
         raise HTTPException(status_code=404, detail={"message": f"Lead '{lead_id}' was not found."})
     delete_crm_lead(lead_id)

@@ -5,9 +5,10 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from app.core.adapters import AdapterFactory, AgentToolResponse, UnknownProtocolError
+from app.core.auth import verify_optional_auth
 from app.core.store import get_events_for_run, get_test_run, record_execution_event
 from app.core.telemetry import execute_and_trace_tool
 from app.schemas.events import ExecutionEvent
@@ -32,6 +33,7 @@ async def execute_agent_tool_endpoint(
     protocol: str,
     run_id: str | None = Query(default=None, description="Test run to attach tool-call telemetry to."),
     payload: dict[str, Any] | None = Body(default=None),
+    auth_info: dict = Depends(verify_optional_auth),
 ) -> dict[str, Any]:
     """Parse, execute and re-format an agent tool call for the given protocol.
 

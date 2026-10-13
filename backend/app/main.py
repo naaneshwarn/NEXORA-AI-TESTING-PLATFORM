@@ -39,6 +39,8 @@ async def root_health() -> dict[str, str]:
 
 from app.api.routes.agent_execution import router as agent_execution_router
 from app.api.routes.crm import router as crm_router
+from app.api.routes.streaming import router as streaming_router
 
 app.include_router(crm_router, prefix=settings.api_prefix)
 app.include_router(agent_execution_router, prefix=settings.api_prefix)
+app.include_router(streaming_router, prefix=settings.api_prefix)
