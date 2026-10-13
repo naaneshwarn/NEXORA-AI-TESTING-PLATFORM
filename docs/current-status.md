@@ -2,7 +2,7 @@
 
 **Last Updated:** October 13, 2026  
 **Active Branch:** `feature/synthetic-api`  
-**Latest Commit:** `507c6d2` (*feat(crm): implement comprehensive CRM tests, protocol execution, and redacted tracing*)  
+**Latest Commit:** `82646d0` (*Merge pull request #6 from naaneshwarn/chore/project-foundation*)\
 **Upstream Base:** `25dab08` (*Publish NEXORA AI Testing Platform source code*)  
 
 ---
@@ -28,7 +28,7 @@ Key milestones delivered on `feature/synthetic-api`:
 | Component | Path | Technology | Current Status |
 | :--- | :--- | :--- | :--- |
 | **Backend API** | [backend/](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/) | FastAPI + Python 3.13 | ✅ Active, verified, 38 passing tests; synthetic environments, stateful CRM, fault injection, protocol adapters (`rest`, `openai`, `langchain`), redacted tracing, execution-event integration, optional auth dependency, and SSE live trace streaming operational |
-| **Frontend UI** | [apps/web/](file:///c:/NEXORA-AI-TESTING-PLATFORM/apps/web/) | React + TypeScript + Vite | 🟡 Scaffold retained for test execution dashboard & orchestration UI |
+| **Frontend UI** | [apps/web/](file:///c:/NEXORA-AI-TESTING-PLATFORM/apps/web/) | React + TypeScript + Vite | ✅ Dashboard scaffold extended with a real-time SSE trace viewer (`useTestRunStream` + `TraceStreamViewer`), 26 Vitest tests, and REST run selection; production build verified |
 | **Legacy/Node API** | [apps/api/](file:///c:/NEXORA-AI-TESTING-PLATFORM/apps/api/) | Node.js + Express | 🟡 Placeholder service retained for backward compatibility |
 | **Shared Lib** | [packages/shared/](file:///c:/NEXORA-AI-TESTING-PLATFORM/packages/shared/) | TypeScript | ✅ Common types and utilities retained |
 | **Documentation** | [docs/](file:///c:/NEXORA-AI-TESTING-PLATFORM/docs/) | Markdown | ✅ Architecture, API contracts, changes log, and current status fully updated |
@@ -154,6 +154,15 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
     - `test_stream_emits_recorded_tool_traces_before_terminal_status`
     - `test_stream_rejects_denied_access_sentinels`
 
+### Frontend Vitest Suite (`apps/web`)
+- **Command**: `npm test --workspace @nexora/web` (Vitest 5 + jsdom + Testing Library)
+- **Result**: **`26 passed`** (2 files)
+  - `src/hooks/useTestRunStream.test.tsx` (14 passed): idle without a run, connecting → connected transition, trace append, success/failure traces, non-terminal vs terminal `run_status` (stream close), malformed payload tolerance, de-duplication, transient → reconnecting → recovery, fatal error, run-id switch reset, cleared run, unmount cleanup.
+  - `src/components/TraceStreamViewer.test.tsx` (12 passed): no-run empty state, connecting state, trace rendering (name/call id/duration), run-status updates, success/failure labels, REST status seeding, malformed payload tolerance, fatal error alert, reconnect → recover, run-id switch, sensitive-value redaction, long tool names.
+- **Type check**: `npm run lint --workspace @nexora/web` (`tsc --noEmit`) passes.
+- **Build**: `npm run build --workspace @nexora/web` (`tsc --noEmit && vite build`) succeeds (21 modules; `dist/assets/index-*.js` ~152.8 kB / 49.9 kB gzip).
+- **Limitation**: the viewer is verified with a mocked `EventSource` (jsdom has no SSE); the browser-to-backend path is covered indirectly by the backend `tests/test_streaming.py` SSE contract tests.
+
 ### Live Verification Cycles
 1. **Synthetic Environment Lifecycle**: Verified `POST /environments` (`provisioning`) → `POST /environments/{id}/ready` (`ready`) → `POST /environments/{id}/stop` (`stopped`).
 2. **Synthetic CRM Leads Lifecycle**: Verified `POST /leads` (201) → `GET /leads/{id}` (200) → `PUT /leads/{id}` (200) → `DELETE /leads/{id}` (204) → `GET /leads/{id}` (404).
@@ -172,7 +181,8 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
   - ✅ Tool-call tracing with sensitive-data redaction delivered (`/test-runs/{run_id}/traces`).
   - ✅ Execution-event integration for profiled tool calls and focused CRM contract coverage delivered (`tests/test_crm.py`, 5 tests).
   - ✅ SSE live trace streaming delivered (`GET /api/v1/test-runs/{run_id}/stream`; 4 tests in `tests/test_streaming.py`).
-  - Next: Add additional adapters (Anthropic tool use, MCP tool schema execution) and wire the SSE stream into the dashboard client.
+  - ✅ SSE stream wired into the dashboard client: `useTestRunStream` hook + `TraceStreamViewer` component, run selection/creation via the REST client, 26 Vitest tests.
+  - Next: Add additional adapters (Anthropic tool use, MCP tool schema execution) and add a browser-level end-to-end check for the live stream.
 - **Rajath (Provisioning & Infrastructure)**:
   - Connect Docker Engine container lifecycle management for real PostgreSQL, MySQL, and MongoDB synthetic environments.
 - **Naaneshwar (Integrations & Service Layer)**:

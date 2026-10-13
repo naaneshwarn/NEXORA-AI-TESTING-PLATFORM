@@ -2,7 +2,7 @@
 
 ## 1. Branch & Context
 - **Branch**: `feature/synthetic-api`
-- **Latest Commit**: `507c6d2` (*feat(crm): implement comprehensive CRM tests, protocol execution, and redacted tracing*)
+- **Latest Commit**: `82646d0` (*Merge pull request #6 from naaneshwarn/chore/project-foundation*)
 - **Upstream Base**: `25dab08` (*Publish NEXORA AI Testing Platform source code*)
 - **Date**: October 13, 2026
 - **Focus**:
@@ -16,6 +16,7 @@
   8. Focused synthetic CRM contract coverage (`tests/test_crm.py`, 5 tests) for CRUD, validation, 404 envelopes, query boundaries, and repeated operations.
   9. Optional authentication dependency (`backend/app/core/auth.py`) accepting `X-API-Key` / `Authorization: Bearer` with deterministic 401/403 simulation sentinels for denied-access testing, attached to the CRM and synthetic execution routers.
   10. Server-Sent Events (SSE) live trace streaming (`GET /api/v1/test-runs/{run_id}/stream`) emitting deduplicated `tool_trace` frames and a terminal `run_status` frame.
+  11. Real-time dashboard integration: a reusable `useTestRunStream` React hook and `TraceStreamViewer` component consuming the SSE stream (with REST-based run status seeding and client-side redaction), plus a 26-test Vitest suite and production build verification.
 
 ---
 
@@ -127,6 +128,19 @@
   - Mounted `streaming_router` under `settings.api_prefix` (`/api/v1`).
 - **Dependencies (`backend/requirements.txt`)**:
   - Pinned `sse-starlette==2.1.3` and `starlette==0.41.3` (the newer `sse-starlette` 3.x pulls a Starlette that conflicts with `fastapi==0.115.6`).
+
+### I. Real-Time SSE Trace Dashboard (Frontend)
+- **Confirmed backend contract** (inspected before building the client):
+  - Endpoint: `GET /api/v1/test-runs/{run_id}/stream` (`text/event-stream`; structured `404` envelope before the stream opens for unknown runs).
+  - `tool_trace` frame: `id` = `"{call_id}:{timestamp}"`, `data` = the stored `ToolCallTraceResponse` JSON — `run_id`, `call_id`, `tool_name`, `parameters` (already redacted server-side), `success`, `result`, `error` (`{code, message}` or `null`), `execution_time_ms`, `timestamp` (ISO 8601).
+  - `run_status` frame: `data` = `{run_id, state, message, completed_at}` where `state` ∈ `queued | running | passed | failed | cancelled`; the stream closes on `completed | failed | cancelled | passed`.
+  - Because a `run_status` frame is only emitted on termination, the current state is seeded from `GET /api/v1/test-runs/{run_id}` on connect.
+- **API client (`apps/web/src/api/testRuns.ts`)**: `API_BASE_URL` from `VITE_API_BASE_URL` (default `http://localhost:8000`), `testRunStreamUrl(runId)`, `createTestRun`, `getTestRun`, `cancelTestRun`. Unwraps the standard `ApiEnvelope` and surfaces the backend `error.message`.
+- **Stream hook (`apps/web/src/hooks/useTestRunStream.ts`)**: connects an `EventSource` when `runId` is set, exposes `traces`, `runStatus`, `runStatusMessage`, `connectionStatus` (`idle | connecting | connected | reconnecting | disconnected | error`), and `error`. Resets run-specific state on run change, ignores malformed JSON, de-duplicates by the SSE `id` (falling back to `call_id:timestamp`), marks `connected` only on the `open` event, treats a transient drop as `reconnecting`, distinguishes fatal (`readyState === CLOSED`) failures, and closes the stream on terminal status or unmount.
+- **Viewer (`apps/web/src/components/TraceStreamViewer.tsx`)**: renders the test run id, run status, connection status (text labels, not colour alone), a scrollable newest-first trace list (tool name, call id, duration, timestamp, success/failure, safe error detail, redacted parameters), plus loading/empty/error states. Seeds the current run status from REST and redacts parameter values defensively (`apps/web/src/utils/redaction.ts` mirrors the backend rules).
+- **Dashboard integration (`apps/web/src/App.tsx`, `apps/web/src/index.css`)**: a "Live run monitoring" panel lets the user watch an existing run id or create one via `POST /api/v1/test-runs`, then renders `<TraceStreamViewer runId={…} />`. Changing the selected run reconnects the stream; the existing metrics/recent-runs UI is unchanged.
+- **Auth note**: browser `EventSource` cannot send custom headers, so the stream is consumed anonymously (the route's optional auth allows this). No token is ever placed in the URL/query string.
+- **Test tooling**: the frontend had no test framework, so Vitest 5 + `@testing-library/react` + `jsdom` were added to `apps/web` (`vitest.config.ts`, `src/test/setup.ts`, `src/test/mockEventSource.ts`) with a `test` script.
 
 ---
 
@@ -390,6 +404,92 @@ diff --git a/backend/app/main.py b/backend/app/main.py
 +app.include_router(streaming_router, prefix=settings.api_prefix)
 ```
 
+### F. Frontend SSE Trace Dashboard
+```diff
+diff --git a/apps/web/src/hooks/useTestRunStream.ts b/apps/web/src/hooks/useTestRunStream.ts
+--- /dev/null
++++ b/apps/web/src/hooks/useTestRunStream.ts
+@@
++export function useTestRunStream(runId: string | null): TestRunStreamState {
++  const [traces, setTraces] = useState<ToolTrace[]>([]);
++  const [connectionStatus, setConnectionStatus] = useState<StreamConnectionStatus>('idle');
++  const seenRef = useRef<Set<string>>(new Set());
++
++  useEffect(() => {
++    seenRef.current = new Set();
++    setTraces([]);
++    if (!runId) { setConnectionStatus('idle'); return; }
++
++    setConnectionStatus('connecting');
++    const source = new EventSource(testRunStreamUrl(runId));
++    let terminal = false;
++
++    const handleOpen = () => { setConnectionStatus('connected'); setError(null); };
++    const handleTrace = (event: Event) => {
++      const message = event as MessageEvent<string>;
++      const trace = parseToolTrace(message.data);
++      if (!trace) return;                       // ignore malformed frames
++      const identity = message.lastEventId || traceIdentity(trace);
++      if (seenRef.current.has(identity)) return; // de-duplicate
++      seenRef.current.add(identity);
++      setTraces((previous) => [...previous, trace]);
++    };
++    const handleStatus = (event: Event) => { /* set runStatus; close if terminal */ };
++    const handleError = () => { /* 'reconnecting' (transient) vs 'error' (readyState CLOSED) */ };
++
++    source.onopen = handleOpen;
++    source.onerror = handleError;
++    source.addEventListener('tool_trace', handleTrace);
++    source.addEventListener('run_status', handleStatus);
++    return () => { source.close(); };
++  }, [runId]);
++
++  return { traces, runStatus, runStatusMessage, connectionStatus, error };
++}
++
+diff --git a/apps/web/src/api/testRuns.ts b/apps/web/src/api/testRuns.ts
+--- /dev/null
++++ b/apps/web/src/api/testRuns.ts
+@@
++export const API_BASE_URL =
++  String(import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000').replace(/\/+$/, '');
++
++export function testRunStreamUrl(runId: string): string {
++  return `${API_BASE_URL}/api/v1/test-runs/${encodeURIComponent(runId)}/stream`;
++}
++
++export async function createTestRun(input: CreateTestRunInput): Promise<TestRunDetail> { /* POST /api/v1/test-runs */ }
++export async function getTestRun(runId: string): Promise<TestRunDetail> { /* GET /api/v1/test-runs/{run_id} */ }
+
+diff --git a/apps/web/src/components/TraceStreamViewer.tsx b/apps/web/src/components/TraceStreamViewer.tsx
+--- /dev/null
++++ b/apps/web/src/components/TraceStreamViewer.tsx
+@@
++export default function TraceStreamViewer({ runId, className }: TraceStreamViewerProps) {
++  const { traces, runStatus, runStatusMessage, connectionStatus, error } = useTestRunStream(runId);
++  const [seedStatus, setSeedStatus] = useState<string | null>(null);
++  // Seed the current state from REST; the stream event wins once it arrives.
++  useEffect(() => { /* getTestRun(runId) → setSeedStatus(run.state) */ }, [runId]);
++  const effectiveStatus = runStatus ?? seedStatus;
++  const newestFirst = useMemo(() => [...traces].reverse(), [traces]);
++  return (/* run/connection badges, error alert, empty states, trace list */);
++}
+
+diff --git a/apps/web/src/App.tsx b/apps/web/src/App.tsx
+--- a/apps/web/src/App.tsx
++++ b/apps/web/src/App.tsx
+@@
++      <section className="panel live-panel">
++        <h2>Live run monitoring</h2>
++        <form onSubmit={handleWatch}>
++          <input value={runIdInput} onChange={…} placeholder="e.g. run_ab12cd34" />
++          <button type="submit">Watch run</button>
++          <button type="button" onClick={handleCreate}>Create test run</button>
++        </form>
++        <TraceStreamViewer runId={streamRunId} />
++      </section>
+```
+
 ---
 
 ## 4. Automated Test Suite Verification
@@ -411,6 +511,14 @@ diff --git a/backend/app/main.py b/backend/app/main.py
 | `tests/test_streaming.py` | 4 | ✅ Passed | Unknown-run `404`, terminal-run `run_status` emission & stream close, deduplicated `tool_trace` frame ordering before `run_status` with redacted payloads, and auth-sentinel rejection on the stream route |
 
 > **Test isolation note:** as with the existing suites, the CRM module exercises the shared in-process in-memory store through a module-level `TestClient(app)`; assertions use generated unique IDs and are order-independent relative to other modules. The auth module verifies the dependency both through its own isolated `FastAPI()` app and against the real `app.main` routers with the synthetic sentinels. The streaming module drives each run to a terminal `cancelled` state so the SSE body is fully buffered, and resets `sse_starlette`'s process-global exit `Event` between tests (a library/`TestClient` event-loop artefact).
+
+### Frontend Test Suite (Vitest)
+- **Command**: `npm test --workspace @nexora/web` (Vitest 5, `jsdom` environment, Testing Library, mocked `EventSource`).
+- **Result**: **`26 passed`** across 2 files:
+  - `src/hooks/useTestRunStream.test.tsx` (14): idle without a run id, `connecting` → `connected` on `open`, trace append, success/failure traces, non-terminal vs terminal `run_status` (stream close), malformed JSON tolerance, de-duplication by identity, transient drop → `reconnecting` → recovery, fatal error, run-id switch reset, cleared run, unmount cleanup.
+  - `src/components/TraceStreamViewer.test.tsx` (12): no-run empty state, `connecting` state, trace rendering (tool name, call id, duration), run-status updates, success/failure labels, REST status seeding, malformed payload tolerance, fatal error alert, reconnect → recover, run-id switch, sensitive-value redaction (`password`/`api_key`/`Authorization`), long tool names.
+- **Type check**: `npm run lint --workspace @nexora/web` (`tsc --noEmit`) → clean.
+- **Build**: `npm run build --workspace @nexora/web` (`tsc --noEmit && vite build`) → success (21 modules, `index-*.js` 152.78 kB / 49.92 kB gzip).
 
 ---
 
@@ -483,17 +591,20 @@ All major user journeys and service interactions were verified against live Fast
 
 ## 7. Uncommitted Working-Tree Changes
 
-Session-scoped changes (uncommitted; belong with Priority 1 & 2 work): the optional authentication dependency, its route integration, the SSE live trace streaming endpoint, and their contract coverage.
+The optional authentication dependency and the SSE live trace streaming endpoint documented in sections G/H were committed as `b812020` (*feat(auth+stream): implement optional auth dependency, SSE live streaming, and comprehensive test suite*). The current uncommitted change set is the **real-time SSE dashboard integration**:
 
 | File | Change |
 | :--- | :--- |
-| `backend/app/core/auth.py` | **New** module: `api_key_header` / `bearer_scheme` (`auto_error=False`), `verify_optional_auth(api_key, bearer)` with Bearer precedence, and the `INVALID_TOKEN` (401) / `FORBIDDEN_TOKEN` (403) denied-access sentinels. |
-| `backend/app/api/routes/crm.py` | Imported `Depends` / `verify_optional_auth` and added `auth_info: dict = Depends(verify_optional_auth)` to all five `/leads` endpoints. |
-| `backend/app/api/routes/agent_execution.py` | Added `auth_info: dict = Depends(verify_optional_auth)` to `POST /synthetic/agent/execute/{protocol}` (imports `Depends` and `verify_optional_auth`). |
-| `backend/app/api/routes/streaming.py` | **New** module: `EventSourceResponse`-backed `GET /test-runs/{run_id}/stream` that de-duplicates `tool_trace` frames by `call_id:timestamp`, watches for terminal run states, emits a final `run_status` frame, and honours client disconnects. |
-| `backend/app/main.py` | Mounted `streaming_router` under `settings.api_prefix`. |
-| `backend/requirements.txt` | Pinned `starlette==0.41.3` and `sse-starlette==2.1.3` (compatible with `fastapi==0.115.6`). |
-| `backend/tests/test_auth.py` | **New** module: 9 focused tests exercising the dependency through an isolated `FastAPI()` app (anonymous allowance, `X-API-Key`, Bearer, Bearer precedence, simulated 401 and 403) and against the real routers (anonymous CRM `200`, CRM `401`, execution `403`). |
-| `backend/tests/test_streaming.py` | **New** module: 4 SSE contract tests (unknown-run `404`, terminal `run_status`, deduplicated `tool_trace` ordering with redacted payload, auth-sentinel `403`) with an `sse_starlette` exit-`Event` reset fixture. |
+| `apps/web/src/api/testRuns.ts` | **New** module: `API_BASE_URL` from `VITE_API_BASE_URL`, `testRunStreamUrl`, `createTestRun`, `getTestRun`, `cancelTestRun`, `ApiEnvelope` unwrapping. |
+| `apps/web/src/hooks/useTestRunStream.ts` | **New** module: `EventSource` lifecycle hook exposing `traces`, `runStatus`, `runStatusMessage`, `connectionStatus`, `error`; malformed-frame tolerance, de-duplication, reconnect vs fatal handling, terminal close, run-switch reset. |
+| `apps/web/src/components/TraceStreamViewer.tsx` | **New** component: run/connection status badges, newest-first trace list, safe error detail, redacted parameters, loading/empty/error states, REST status seeding. |
+| `apps/web/src/utils/redaction.ts`, `apps/web/src/utils/format.ts` | **New** helpers: client-side mirror of the backend redaction rules and human-readable duration/timestamp formatting. |
+| `apps/web/src/App.tsx`, `apps/web/src/index.css` | Added the "Live run monitoring" panel (watch an existing run id or create one) and viewer styling; existing metrics/recent-runs UI preserved. |
+| `apps/web/src/hooks/useTestRunStream.test.tsx`, `apps/web/src/components/TraceStreamViewer.test.tsx` | **New** Vitest suites: 26 tests total. |
+| `apps/web/src/test/setup.ts`, `apps/web/src/test/mockEventSource.ts`, `apps/web/vitest.config.ts` | **New** test infrastructure: Testing Library setup, `EventSource` mock, Vitest config (jsdom + shared-package source alias). |
+| `apps/web/package.json`, `apps/web/tsconfig.json` | Added the `test`/`test:watch` scripts, Vitest/testing-library/jsdom dev dependencies, and the `vitest/globals` type. |
+| `apps/web/.env.example` | **New** sample config documenting `VITE_API_BASE_URL`. |
+| `apps/web/README.md` | **New** frontend documentation: SSE contract, configuration, run/test commands, limitations. |
+| `package-lock.json` | Regenerated by installing the new frontend dev dependencies. |
 
-Result: **38 passed** (0 failures, 0 errors) in ~0.98s. Run with `backend/.venv/Scripts/python.exe -m pytest -v`. `docs/current-status.md` and this log were updated to match (uncommitted).
+Result: backend **38 passed**; frontend **26 passed**; `tsc --noEmit` and `vite build` both clean. Run the backend with `backend/.venv/Scripts/python.exe -m pytest -v` and the frontend with `npm test --workspace @nexora/web`. `docs/current-status.md` and this log were updated to match (uncommitted).
