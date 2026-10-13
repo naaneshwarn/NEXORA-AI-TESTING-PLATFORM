@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Body, HTTPException, Query
 
 from app.core.adapters import AdapterFactory, AgentToolResponse, UnknownProtocolError
-from app.core.store import get_test_run
+from app.core.store import get_events_for_run, get_test_run, record_execution_event
 from app.core.telemetry import execute_and_trace_tool
+from app.schemas.events import ExecutionEvent
 
 router = APIRouter(tags=["synthetic-agent"])
 
@@ -61,6 +63,37 @@ async def execute_agent_tool_endpoint(
         return adapter.format_response(response)
 
     outcome = await execute_and_trace_tool(run_id, request.call_id, request.tool_name, request.parameters)
+
+    # Record a tool-call execution event for the run so profiled executions are
+    # visible through the existing event system (GET /test-runs/{run_id}/events).
+    if run_id:
+        record_execution_event(
+            run_id,
+            ExecutionEvent(
+                event_id=f"event-{uuid4().hex[:8]}",
+                run_id=run_id,
+                event_type="tool_call",
+                sequence=len(get_events_for_run(run_id)) + 1,
+                message=f"Executing tool {request.tool_name}",
+                timestamp=datetime.now(timezone.utc),
+                tool_calls=[
+                    {
+                        "call_id": request.call_id,
+                        "tool_name": request.tool_name,
+                        "status": "success" if outcome.success else "failed",
+                        # Only the redacted telemetry is safe to expose here.
+                        "payload": outcome.trace.parameters if outcome.trace else request.parameters,
+                    }
+                ],
+                payload={
+                    "call_id": request.call_id,
+                    "tool_name": request.tool_name,
+                    "success": outcome.success,
+                    "execution_time_ms": outcome.execution_time_ms,
+                },
+            ),
+        )
+
     response = AgentToolResponse(
         call_id=request.call_id,
         success=outcome.success,
