@@ -128,3 +128,61 @@ def test_traces_endpoints_handle_missing_records() -> None:
     )
     run_id = run.json()["data"]["run_id"]
     assert client.get(f"/api/v1/test-runs/{run_id}/traces").status_code == 404
+
+
+def test_execution_dispatcher_writes_tool_call_event_for_run() -> None:
+    """Profiled executions produce both a trace and a tool_call execution event."""
+    run = client.post(
+        "/api/v1/test-runs",
+        json={"suite_name": "event trace run", "environment": "local", "target_agents": []},
+    )
+    run_id = run.json()["data"]["run_id"]
+
+    execution = client.post(
+        f"/api/v1/synthetic/agent/execute/rest?run_id={run_id}",
+        json={
+            "call_id": "call-event-1",
+            "tool_name": "list_crm_leads",
+            "parameters": {"api_key": "event-secret-123"},
+        },
+    )
+    assert execution.status_code == 200
+    assert execution.json()["success"] is True
+
+    events = client.get(f"/api/v1/test-runs/{run_id}/events")
+    assert events.status_code == 200
+    data = events.json()["data"]
+
+    tool_events = [event for event in data if event["event_type"] == "tool_call"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["tool_calls"][0]["tool_name"] == "list_crm_leads"
+    assert tool_events[0]["tool_calls"][0]["status"] == "success"
+    # The event payload reuses the redacted telemetry, never the raw secret.
+    assert tool_events[0]["tool_calls"][0]["payload"]["api_key"] == REDACTED
+    assert "event-secret-123" not in events.text
+
+
+def test_execution_dispatcher_writes_failure_tool_call_event() -> None:
+    """Failed executions still produce an event carrying safe error metadata."""
+    run = client.post(
+        "/api/v1/test-runs",
+        json={"suite_name": "failure event run", "environment": "local", "target_agents": []},
+    )
+    run_id = run.json()["data"]["run_id"]
+
+    execution = client.post(
+        f"/api/v1/synthetic/agent/execute/openai?run_id={run_id}",
+        json={
+            "id": "call-fail-1",
+            "type": "function",
+            "function": {"name": "missing_tool_xyz", "arguments": {}},
+        },
+    )
+    assert execution.status_code == 200
+    assert execution.json()["role"] == "tool"
+
+    events = client.get(f"/api/v1/test-runs/{run_id}/events")
+    tool_events = [event for event in events.json()["data"] if event["event_type"] == "tool_call"]
+    assert len(tool_events) == 1
+    assert tool_events[0]["tool_calls"][0]["status"] == "failed"
+    assert tool_events[0]["payload"]["success"] is False
