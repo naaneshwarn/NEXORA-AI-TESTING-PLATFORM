@@ -160,6 +160,28 @@ def test_secret_variables_never_appear_in_http_responses() -> None:
     assert "[REDACTED]" in traces.text
 
 
+def test_agent_failure_scenario_fails_with_diagnostic_report_over_http() -> None:
+    run_id = _create_run("crm-read-customer-agent-failure")
+
+    state = client.get(f"/api/v1/test-runs/{run_id}").json()["data"]
+    assert state["state"] == "failed"
+
+    report = client.get(f"/api/v1/test-runs/{run_id}/report").json()["data"]
+    assert report["status"] == "fail"
+    assert report["score"] < report["pass_threshold"]
+    assert report["findings"], "a failing run must publish diagnostic findings"
+
+
+def test_invalid_pass_threshold_surfaces_clear_error_over_http() -> None:
+    run_id = _create_run("crm-read-customer-summary", config={"pass_threshold": 400})
+
+    state = client.get(f"/api/v1/test-runs/{run_id}").json()["data"]
+    assert state["state"] == "failed"
+    assert "pass_threshold" in state["message"]
+    # No report is published for a run that failed before evaluation.
+    assert client.get(f"/api/v1/test-runs/{run_id}/report").status_code == 404
+
+
 def test_full_demo_flow_pass_and_fail() -> None:
     """The Phase 3 guide's demonstration: one passing and one failing scenario."""
     agent = client.post(
