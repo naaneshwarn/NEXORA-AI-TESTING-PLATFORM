@@ -220,3 +220,98 @@ def test_state_helpers() -> None:
     assert state.last_node is None
     state.visited.append("only")
     assert state.last_node == "only"
+
+
+# --------------------------------------------------------------------------
+# Explicit cleanup guarantees (Phase 3 guide: "handle cleanup explicitly")
+# --------------------------------------------------------------------------
+
+
+def _cleanup_graph(log: list[str], *, error_node: bool = False, abort_flags: dict | None = None):
+    """Build a graph whose middle node either succeeds or explodes."""
+
+    def maybe_boom(state: WorkflowState) -> None:
+        log.append("work")
+        if error_node:
+            raise RuntimeError("work failed")
+
+    def start(state: WorkflowState) -> None:
+        log.append("start")
+        if abort_flags is not None:
+            abort_flags["value"] = True  # cancel while the graph is mid-flight
+
+    return (
+        WorkflowGraph()
+        .add_node("start", start)
+        .add_node("work", maybe_boom)
+        .add_node("cleanup", _record("cleanup", log))
+        .add_node("finalize", _record("finalize", log))
+        .add_edge("start", "work")
+        .add_edge("work", "cleanup")
+        .add_edge("cleanup", "finalize")
+        .set_entry("start")
+        .set_cleanup("cleanup")
+        .set_finalize("finalize")
+    )
+
+
+def test_cleanup_runs_exactly_once_on_the_success_path() -> None:
+    log: list[str] = []
+
+    state = _invoke(_cleanup_graph(log).compile(), WorkflowState(run_id="run-clean-ok"))
+
+    assert state.error is None
+    assert log == ["start", "work", "cleanup", "finalize"]
+
+
+def test_cleanup_runs_exactly_once_on_the_failure_path() -> None:
+    log: list[str] = []
+
+    state = _invoke(_cleanup_graph(log, error_node=True).compile(), WorkflowState(run_id="run-clean-fail"))
+
+    assert state.error is not None and state.error["code"] == "workflow_node_error"
+    # cleanup still executes before finalize even though "work" exploded.
+    assert log == ["start", "work", "cleanup", "finalize"]
+
+
+def test_cleanup_runs_exactly_once_on_the_cancellation_path() -> None:
+    log: list[str] = []
+    abort_flags = {"value": False}
+
+    state = _invoke(
+        _cleanup_graph(log, abort_flags=abort_flags).compile(),
+        WorkflowState(run_id="run-clean-cancel", should_abort=lambda: abort_flags["value"]),
+    )
+
+    assert state.cancelled is True
+    # "work" is skipped by the abort check, but cleanup and finalize still run once.
+    assert log == ["start", "cleanup", "finalize"]
+
+
+def test_cleanup_is_skipped_when_not_configured() -> None:
+    log: list[str] = []
+    graph = (
+        WorkflowGraph()
+        .add_node("start", _record("start", log))
+        .add_node("finalize", _record("finalize", log))
+        .add_edge("start", "finalize")
+        .set_entry("start")
+        .set_finalize("finalize")
+    )
+
+    state = _invoke(graph.compile(), WorkflowState(run_id="run-no-cleanup"))
+
+    assert log == ["start", "finalize"]
+
+
+def test_cleanup_definition_errors_are_rejected_eagerly() -> None:
+    with pytest.raises(WorkflowDefinitionError, match="not registered"):
+        WorkflowGraph().add_node("f", lambda state: None).set_finalize("f").set_cleanup("ghost")
+
+    with pytest.raises(WorkflowDefinitionError, match="distinct from the finalize"):
+        WorkflowGraph().add_node("f", lambda state: None).set_finalize("f").set_cleanup("f")
+
+    with pytest.raises(WorkflowDefinitionError, match="entry node"):
+        WorkflowGraph().add_node("s", lambda state: None).add_node("f", lambda state: None).set_entry(
+            "s"
+        ).set_finalize("f").set_cleanup("s").compile()

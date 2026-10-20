@@ -13,6 +13,9 @@ Design guarantees:
 - Failure-safe: an exception inside a node is captured on the state as a
   normalized error and the graph still routes to finalize, so a broken node
   can never leave a run half-executed.
+- Explicit cleanup: when the graph declares a cleanup node via
+  ``set_cleanup``, every exit path (success, node failure, routing error,
+  cancellation) passes through it exactly once before finalize.
 """
 
 from __future__ import annotations
@@ -60,6 +63,7 @@ class WorkflowGraph:
         self._edges: dict[str, str] = {}
         self._conditional: dict[str, tuple[RouterFn, dict[str, str]]] = {}
         self._entry: str | None = None
+        self._cleanup: str | None = None
         self._finalize: str | None = None
 
     def add_node(self, name: str, fn: NodeFn) -> "WorkflowGraph":
@@ -96,8 +100,23 @@ class WorkflowGraph:
         self._entry = name
         return self
 
+    def set_cleanup(self, name: str) -> "WorkflowGraph":
+        """Declare the cleanup node that runs exactly once before finalize.
+
+        Every exit path — normal completion, node failure, routing error, and
+        cancellation — is routed through this node before the finalize node
+        executes, so resource release is an explicit, testable step.
+        """
+        self._require_node(name)
+        if self._finalize is not None and name == self._finalize:
+            raise WorkflowDefinitionError("Cleanup node must be distinct from the finalize node.")
+        self._cleanup = name
+        return self
+
     def set_finalize(self, name: str) -> "WorkflowGraph":
         self._require_node(name)
+        if self._cleanup is not None and name == self._cleanup:
+            raise WorkflowDefinitionError("Finalize node must be distinct from the cleanup node.")
         self._finalize = name
         return self
 
@@ -106,11 +125,14 @@ class WorkflowGraph:
             raise WorkflowDefinitionError("Graph has no entry node; call set_entry().")
         if self._finalize is None:
             raise WorkflowDefinitionError("Graph has no finalize node; call set_finalize().")
+        if self._cleanup is not None and self._cleanup == self._entry:
+            raise WorkflowDefinitionError("Cleanup node must not be the entry node.")
         return CompiledWorkflow(
             nodes=dict(self._nodes),
             edges=dict(self._edges),
             conditional={key: (router, dict(mapping)) for key, (router, mapping) in self._conditional.items()},
             entry=self._entry,
+            cleanup=self._cleanup,
             finalize=self._finalize,
         )
 
@@ -129,38 +151,63 @@ class CompiledWorkflow:
         conditional: dict[str, tuple[RouterFn, dict[str, str]]],
         entry: str,
         finalize: str,
+        cleanup: str | None = None,
     ) -> None:
         self._nodes = nodes
         self._edges = edges
         self._conditional = conditional
         self._entry = entry
+        self._cleanup = cleanup
         self._finalize = finalize
 
+    def _exit_target(self, cleanup_done: bool) -> str:
+        """First node of the exit sequence: cleanup (once) then finalize."""
+        if self._cleanup is not None and not cleanup_done:
+            return self._cleanup
+        return self._finalize
+
     async def invoke(self, state: WorkflowState) -> WorkflowState:
-        """Run the graph to completion and return the final state."""
+        """Run the graph to completion and return the final state.
+
+        Every exit — normal completion, node failure, routing error, or
+        cancellation — passes through the cleanup node (when configured)
+        exactly once before finalize runs.
+        """
         current: str | None = self._entry
         finalize_pending = False
+        cleanup_done = False
 
         while current is not None:
-            if current != self._finalize and not finalize_pending:
+            is_exit_node = current in (self._finalize, self._cleanup)
+            if not is_exit_node and not finalize_pending:
                 if state.should_abort is not None and state.should_abort():
                     state.cancelled = True
-                    current = self._finalize
+                    current = self._exit_target(cleanup_done)
                     continue
 
             await self._run_node(current, state)
+
+            if current == self._cleanup:
+                cleanup_done = True
+                current = self._finalize
+                continue
 
             if current == self._finalize:
                 current = None
                 continue
 
             if state.error is not None and not finalize_pending:
-                # Route to finalize so failures always release resources.
+                # Route to the exit sequence so failures always release
+                # resources and finalize exactly once.
                 finalize_pending = True
-                current = self._finalize
+                current = self._exit_target(cleanup_done)
                 continue
 
-            current = self._next_node(current, state)
+            nxt = self._next_node(current, state)
+            # Normal completion also honours the cleanup-before-finalize rule.
+            if nxt == self._finalize and self._cleanup is not None and not cleanup_done:
+                nxt = self._cleanup
+            current = nxt
 
         return state
 

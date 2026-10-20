@@ -9,8 +9,13 @@ Scoring (weights sum to 100):
 - task_completion (40): did the agent complete a lookup and produce a summary?
 - factual_correctness (40): does the summary contain every expected record
   field value and none of the scenario's forbidden (invented) markers?
-- trace_integrity (20): was a successful, redacted tool-call trace recorded —
-  and do the persisted artifacts contain no secret values from run variables?
+- trace_integrity (20): was a successful, redacted tool-call trace recorded?
+
+Security scanning (secret-leak detection) is maintained as a separate,
+independently selectable check in :mod:`app.workflow.security_checks`;
+``evaluate_run`` applies its result to the trace-integrity criterion and the
+findings list, so a leaked secret still zeroes trace integrity and blocks a
+passing result without the scoring code owning the detection logic.
 
 The pass threshold is configurable per run (0-100) and defaults to
 :data:`DEFAULT_PASS_THRESHOLD`; the chosen value is always embedded in the
@@ -21,15 +26,18 @@ passing result regardless of the numeric score.
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
-from app.core.redaction import SENSITIVE_KEYS
 from app.schemas.workflow_report import CriterionScore, Finding
 from app.workflow.agent_client import AgentTurnOutcome
 from app.workflow.scenarios import ScenarioDefinition
+from app.workflow.security_checks import (
+    SecurityCheckResult,
+    evaluate_security,
+    extract_secret_values,  # re-exported: kept importable from this module
+)
 
 DEFAULT_PASS_THRESHOLD = 70.0
 MIN_PASS_THRESHOLD = 0.0
@@ -40,8 +48,6 @@ CRITERION_WEIGHTS: dict[str, float] = {
     "factual_correctness": 40.0,
     "trace_integrity": 20.0,
 }
-
-_NORMALIZED_SENSITIVE_KEYS = frozenset(re.sub(r"[^a-z0-9]", "", key.lower()) for key in SENSITIVE_KEYS)
 
 
 class InvalidPassThreshold(ValueError):
@@ -72,27 +78,6 @@ class EvaluationOutcome:
 
 def _normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
-
-
-def extract_secret_values(variables: dict[str, Any]) -> list[str]:
-    """Collect values of sensitive scenario variables for leak detection."""
-    secrets: list[str] = []
-    for key, value in variables.items():
-        normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
-        if normalized_key in _NORMALIZED_SENSITIVE_KEYS and isinstance(value, str) and value:
-            secrets.append(value)
-    return secrets
-
-
-def _artifact_contains_secret(artifacts: Iterable[Any], secrets: list[str]) -> str | None:
-    """Return the first secret found in the serialized artifacts, if any."""
-    if not secrets:
-        return None
-    serialized = json.dumps(list(artifacts), default=str, sort_keys=True)
-    for secret in secrets:
-        if secret in serialized:
-            return secret
-    return None
 
 
 def evaluate_run(
@@ -193,23 +178,23 @@ def evaluate_run(
 
     # --- trace integrity -------------------------------------------------
     successful_traces = [trace for trace in traces if trace.get("success")]
-    run_variables = run_variables or {}
-    secrets = extract_secret_values(run_variables)
-    leaked_secret = _artifact_contains_secret(
-        [traces, summary, outcome.record], secrets
-    )
 
-    if leaked_secret is not None:
+    # Security scanning lives in app.workflow.security_checks and runs as a
+    # separate, independently selectable check; its result still gates the
+    # trace-integrity criterion below (a leaked secret zeroes trace score
+    # and blocks a pass via the critical finding).
+    security: SecurityCheckResult = evaluate_security(
+        traces=traces,
+        summary=summary,
+        record=outcome.record,
+        run_variables=run_variables,
+        evidence_ref=outcome.call_id,
+    )
+    findings.extend(security.findings)
+
+    if security.leaked:
         trace_score = 0.0
         trace_rationale = "A secret scenario variable leaked into persisted run artifacts."
-        findings.append(
-            Finding(
-                severity="critical",
-                code="secret_exposure",
-                message="A secret value from the run variables appeared in traces or reports.",
-                evidence_ref=outcome.call_id,
-            )
-        )
     elif successful_traces:
         trace_score = 100.0
         trace_rationale = f"{len(successful_traces)} redacted tool-call trace(s) recorded."

@@ -201,8 +201,14 @@ def test_bound_environment_must_be_ready() -> None:
     assert "not 'ready'" in run.message
     error_events = [e for e in get_events_for_run(run_id) if e.event_type == "error"]
     assert error_events and error_events[0].payload.get("code") == "environment_not_ready"
-    # No evaluation report is published when the workflow could not run the agent.
-    assert get_workflow_report_for_run(run_id) is None
+    # Phase 3 guide: an environment failure still publishes a useful
+    # failed-run report (zero score, critical finding, evidence).
+    report = get_workflow_report_for_run(run_id)
+    assert report is not None
+    assert report["status"] == "fail"
+    assert report["score"] == 0.0
+    assert any(finding["code"] == "environment_not_ready" for finding in report["findings"])
+    assert report["evidence"]["event_ids"]
 
 
 def test_ready_environment_allows_the_run() -> None:
@@ -229,6 +235,41 @@ def test_unknown_environment_id_fails_the_run() -> None:
 
     assert result["state"] == "failed"
     assert "was not found" in get_test_run(run_id).message
+    # Environment failures also publish a useful failed-run report.
+    report = get_workflow_report_for_run(run_id)
+    assert report is not None
+    assert report["status"] == "fail"
+    assert any(finding["code"] == "environment_not_found" for finding in report["findings"])
+
+
+def test_validation_errors_stay_report_less() -> None:
+    """Invalid configuration fails the run before evaluation: no report, per contract."""
+    run_id = _make_run("crm-read-customer-summary", config={"pass_threshold": 999})
+
+    result = _execute(run_id)
+
+    assert result["state"] == "failed"
+    assert get_workflow_report_for_run(run_id) is None
+
+
+def test_cleanup_runs_on_both_success_and_failure_paths() -> None:
+    """Phase 3 guide: cleanup is an explicit workflow step on every exit path."""
+    passing = _make_run("crm-read-customer-summary")
+    _execute(passing)
+    passing_cleanup = [
+        e for e in get_events_for_run(passing) if "cleanup" in e.message.lower()
+    ]
+    assert len(passing_cleanup) == 1
+
+    env = create_environment(
+        SyntheticEnvironment(environment_id="env-failing-provisioning", environment_type="postgres", label="c")
+    )
+    failing = _make_run("crm-read-customer-summary", config={"environment_id": env.environment_id})
+    _execute(failing)
+    failing_cleanup = [
+        e for e in get_events_for_run(failing) if "cleanup" in e.message.lower()
+    ]
+    assert len(failing_cleanup) == 1
 
 
 # --------------------------------------------------------------------------

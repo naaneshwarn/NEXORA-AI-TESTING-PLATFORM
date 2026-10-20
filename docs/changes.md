@@ -666,6 +666,39 @@ Result: backend **38 passed**; frontend **26 passed**; `tsc --noEmit` and `vite 
 | Scenarios, agent client, evaluator | `484eeb4` | 62 passed |
 | Orchestration service + store helpers | `0fe30da` | 82 passed |
 | API integration | `c4dd376` | 94 passed |
-| E2E HTTP coverage | `b73e073` | **96 passed** |
+| E2E HTTP coverage | `b73e073` | 96 passed |
+| Professional audit fixes | *(final milestone commit)* | **109 passed** |
 
 All commits are local on `feature/workflow-evaluation-reporting` and have **not been pushed** (per instruction).
+
+---
+
+## H. Professional Audit & Hardening — final milestone commit
+
+A professional self-audit was run against the Phase 3 guide's acceptance criteria. Three genuine gaps were found and fixed.
+
+### Gap 1 — Environment failure now publishes a useful failed-run report
+- **Before**: an environment failure set `state.error` and the engine routed straight to finalize, so the run failed with **no report** — contradicting the guide's criterion *"Environment/agent failure produces a useful failed-run report where possible"* and the service docstring.
+- **After**: `WorkflowRunExecutor._publish_failure_report()` (called from `n_finalize` on the error path) builds a zero-scored `WorkflowReport` with a **critical finding carrying the error code** (`environment_not_found` / `environment_not_ready`), full evidence references, and a `ReportSummary` projection so `GET /reports/{id}` also works. Validation-stage errors (invalid `pass_threshold`, unknown scenario, missing context) intentionally stay report-less because the run was never a legitimate evaluation.
+- **Tests**: `test_bound_environment_must_be_ready` and `test_unknown_environment_id_fails_the_run` now assert the failed report; `test_validation_errors_stay_report_less` pins the boundary; the HTTP demo flow asserts the environment-failure report end to end.
+
+### Gap 2 — Explicit cleanup node on every exit path
+- **Before**: there was no explicit cleanup step; the engine routed errors and cancellations straight to finalize.
+- **After**: `WorkflowGraph.set_cleanup(name)` declares a cleanup node, and `CompiledWorkflow.invoke` guarantees it runs **exactly once before finalize on all four exit paths** — normal completion, node failure, routing error, and cancellation. The service wires `n_cleanup`, which releases scenario-owned resources (an explicit, idempotent no-op recording what it inspected) and emits an auditable `heartbeat` event.
+- **Tests**: 5 new engine tests (success / failure / cancellation / not-configured / definition validation) plus a service test asserting exactly one cleanup event on both success and failure paths.
+
+### Gap 3 — Security checks extracted into a standalone module
+- **Before**: secret-leak detection was embedded inside the `trace_integrity` scoring block in `evaluator.py`, so security logic and scoring logic were entangled.
+- **After**: new `backend/app/workflow/security_checks.py` owns `extract_secret_values`, `artifact_contains_secret`, and `evaluate_security`, returning a `SecurityCheckResult` with critical `secret_exposure` findings. `evaluate_run` calls it as a separate step and still applies its result to trace integrity, so behaviour is unchanged (a leaked secret zeroes trace integrity and blocks a pass) while the check is independently selectable and testable. `extract_secret_values` remains importable from `evaluator` for backward compatibility.
+- **Tests**: new `backend/tests/test_security_checks.py` (7 tests) exercises the module directly.
+
+### Verification
+- Full suite: **109 passed** (was 96), ~1.3s, no network / Docker / credentials.
+- Live uvicorn re-verification: pass run (`100.00`/`pass`), environment-failure run (`fail`, `0.0`, `environment_not_ready`), cleanup event observable before finalize, secret canary never present in the report response.
+- Secret scan of the whole diff: only intentional test canaries; no real credentials.
+
+### Documented coordination items (not code defects)
+1. `store.py` remains lead-owned — the additive workflow helpers still await team review.
+2. Naaneshwar's `TargetAgent` interface is not yet in the repo; `SyntheticToolAgentClient` is the documented seam.
+3. Report-field/scoring sign-off by the team is still pending (schemas were kept additive-only).
+4. The WhatsApp reference image is unreadable (no image input available), so any content in it is unaddressed.

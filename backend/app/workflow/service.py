@@ -4,7 +4,7 @@ Coordinates the full lifecycle of an automated test run:
 
     validate run -> verify environment -> build scenario input
       -> invoke target agent -> collect traces -> evaluate expected vs actual
-      -> publish report -> finalize run state
+      -> publish report -> cleanup -> finalize run state
 
 The service is deterministic and needs no LLM credentials or Docker: the
 default agent client is the synthetic mock, and environment readiness is a
@@ -43,9 +43,10 @@ from app.schemas.environment import SyntheticEnvironment
 from app.schemas.events import ExecutionEvent
 from app.schemas.evaluation import EvaluationSubmission
 from app.schemas.test_run import RunCreateRequest, RunDetail
-from app.schemas.workflow_report import Finding, ReportEvidence, WorkflowReport
+from app.schemas.workflow_report import CriterionScore, Finding, ReportEvidence, WorkflowReport
 from app.workflow.agent_client import AgentTurnOutcome, SyntheticToolAgentClient
 from app.workflow.evaluator import (
+    CRITERION_WEIGHTS,
     DEFAULT_PASS_THRESHOLD,
     EvaluationOutcome,
     InvalidPassThreshold,
@@ -329,35 +330,20 @@ class WorkflowRunExecutor:
         assert evaluation is not None
 
         outcome = self.agent_outcome
-        run = get_test_run(self.run_id)
-        started = run.started_at if run else None
         completed = _utc_now()
-        duration_ms = 0.0
-        if started is not None:
-            duration_ms = max((completed - started).total_seconds() * 1000.0, 0.0)
-
         findings = list(evaluation.findings) + self.service_findings
         events = get_events_for_run(self.run_id)
 
-        report = WorkflowReport(
-            report_id=f"wfreport-{uuid4().hex[:8]}",
-            run_id=self.run_id,
-            scenario_id=self.scenario.scenario_id,
-            status=evaluation.status,  # type: ignore[arg-type]
+        report = self._build_report(
+            status=evaluation.status,
             score=evaluation.score,
-            pass_threshold=self.context.pass_threshold,
             summary=evaluation.summary,
             criteria=evaluation.criteria,
             findings=findings,
-            evidence=ReportEvidence(
-                scenario_id=self.scenario.scenario_id,
-                agent_ids=list(self.context.agent_ids),
-                tool_call_ids=[outcome.call_id] if outcome else [],
-                event_ids=[event.event_id for event in events],
-            ),
+            tool_call_ids=[outcome.call_id] if outcome else [],
+            event_ids=[event.event_id for event in events],
+            completed=completed,
             workflow_state="passed" if evaluation.status == "pass" else "failed",
-            duration_ms=round(duration_ms, 3),
-            generated_at=completed,
         )
         save_workflow_report(report.model_dump())
         self.report_id = report.report_id
@@ -379,6 +365,133 @@ class WorkflowRunExecutor:
         )
         self.summary_report_id = summary.report_id
 
+    def _publish_failure_report(self, error: dict[str, Any]) -> None:
+        """Publish a useful failed-run report for an early workflow failure.
+
+        The Phase 3 guide requires environment (and other post-validation)
+        failures to produce a failed report "where possible".  Once the
+        validate node has resolved the scenario and context we can always
+        build one: zero-scored criteria, a critical finding carrying the
+        error code, and evidence references.  Validation-stage errors
+        (bad config, unknown scenario) stay report-less because the run was
+        never a legitimate evaluation.
+        """
+        if self.scenario is None or self.context is None or self.report_id is not None:
+            return
+
+        message = str(error.get("message", "Workflow failed."))
+        error_code = str(error.get("code", "workflow_error"))
+        completed = _utc_now()
+        events = get_events_for_run(self.run_id)
+
+        criteria = [
+            CriterionScore(
+                criterion=name,
+                weight=weight,
+                score=0.0,
+                rationale=f"Not evaluated: the workflow stopped before evaluation ({error_code}).",
+            )
+            for name, weight in CRITERION_WEIGHTS.items()
+        ]
+        findings = [
+            Finding(
+                severity="critical",
+                code=error_code,
+                message=message,
+            )
+        ]
+
+        report = self._build_report(
+            status="fail",
+            score=0.0,
+            summary=(
+                f"Scenario '{self.scenario.scenario_id}' failed before evaluation: {message}"
+            ),
+            criteria=criteria,
+            findings=findings,
+            tool_call_ids=[],
+            event_ids=[event.event_id for event in events],
+            completed=completed,
+            workflow_state="failed",
+        )
+        save_workflow_report(report.model_dump())
+        self.report_id = report.report_id
+
+        submit_evaluation(
+            EvaluationSubmission(
+                run_id=self.run_id,
+                score=report.score,
+                status="fail",
+                summary=report.summary,
+                metrics={"pass_threshold": report.pass_threshold},
+                issues=[message],
+            )
+        )
+
+    def _build_report(
+        self,
+        *,
+        status: str,
+        score: float,
+        summary: str,
+        criteria: list[CriterionScore],
+        findings: list[Finding],
+        tool_call_ids: list[str],
+        event_ids: list[str],
+        completed: datetime,
+        workflow_state: str,
+    ) -> WorkflowReport:
+        """Assemble the workflow report from its parts (shared by success and failure paths)."""
+        assert self.scenario is not None and self.context is not None
+        run = get_test_run(self.run_id)
+        started = run.started_at if run else None
+        duration_ms = 0.0
+        if started is not None:
+            duration_ms = max((completed - started).total_seconds() * 1000.0, 0.0)
+
+        return WorkflowReport(
+            report_id=f"wfreport-{uuid4().hex[:8]}",
+            run_id=self.run_id,
+            scenario_id=self.scenario.scenario_id,
+            status=status,  # type: ignore[arg-type]
+            score=score,
+            pass_threshold=self.context.pass_threshold,
+            summary=summary,
+            criteria=criteria,
+            findings=findings,
+            evidence=ReportEvidence(
+                scenario_id=self.scenario.scenario_id,
+                agent_ids=list(self.context.agent_ids),
+                tool_call_ids=tool_call_ids,
+                event_ids=event_ids,
+            ),
+            workflow_state=workflow_state,
+            duration_ms=round(duration_ms, 3),
+            generated_at=completed,
+        )
+
+    def n_cleanup(self, state: WorkflowState) -> None:
+        """Release scenario-owned resources before finalize (guide: explicit cleanup).
+
+        Built-in scenarios never own a temporary environment — they run
+        against the shared synthetic store or a caller-bound environment that
+        belongs to the platform's lifecycle, not the scenario — so cleanup is
+        an explicit, idempotent no-op that records what it inspected.  If a
+        future scenario provisions its own resources, this is the single
+        place that must release them; the engine routes success, failure,
+        and cancellation through here exactly once.
+        """
+        if state.data.get("cleanup_completed"):
+            return
+        environment = state.data.get("environment") or {}
+        _record_event(
+            self.run_id,
+            "heartbeat",
+            "Workflow cleanup complete: no scenario-owned temporary resources to release.",
+            {"environment_mode": environment.get("mode", "unresolved")},
+        )
+        state.data["cleanup_completed"] = True
+
     def n_finalize(self, state: WorkflowState) -> None:
         if state.cancelled:
             update_test_run_state(
@@ -392,8 +505,16 @@ class WorkflowRunExecutor:
 
         if state.error is not None:
             message = state.error.get("message", "Workflow failed.")
+            # Post-validation failures (environment, agent crash) still get a
+            # useful failed report; validation-stage errors stay report-less.
+            self._publish_failure_report(state.error)
             update_test_run_state(self.run_id, "failed", message, mark_completed=True)
-            _record_event(self.run_id, "error", message, {"code": state.error.get("code")})
+            _record_event(
+                self.run_id,
+                "error",
+                message,
+                {"code": state.error.get("code"), "report_id": self.report_id},
+            )
             return
 
         if self.evaluation is None:
@@ -426,14 +547,17 @@ class WorkflowRunExecutor:
             .add_node("invoke_agent", self.n_invoke_agent)
             .add_node("evaluate", self.n_evaluate)
             .add_node("publish_report", self.n_publish_report)
+            .add_node("cleanup", self.n_cleanup)
             .add_node("finalize", self.n_finalize)
             .add_edge("validate", "verify_environment")
             .add_edge("verify_environment", "build_scenario")
             .add_edge("build_scenario", "invoke_agent")
             .add_edge("invoke_agent", "evaluate")
             .add_edge("evaluate", "publish_report")
-            .add_edge("publish_report", "finalize")
+            .add_edge("publish_report", "cleanup")
+            .add_edge("cleanup", "finalize")
             .set_entry("validate")
+            .set_cleanup("cleanup")
             .set_finalize("finalize")
             .compile()
         )

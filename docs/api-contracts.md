@@ -258,8 +258,9 @@ Evaluation rules (implemented in `backend/app/workflow/evaluator.py`):
 
 - Weighted score = `task_completion * 0.40 + factual_correctness * 0.40 + trace_integrity * 0.20`.
 - `pass` requires `score >= pass_threshold` **and** zero `critical` findings — a critical finding (e.g. a secret leak or an unsupported fact) always forces `fail`, regardless of score.
-- Invalid `config.pass_threshold` (non-numeric or outside 0–100) fails the run before evaluation with a clear `pass_threshold` message and publishes no report (`GET .../report` → `404`).
-- All secrets supplied through `scenario.variables` are redacted before storage; reports, traces, and events never contain raw secret values.
+- Environment failures (`environment_not_found`, `environment_not_ready`) occur **after** validation, so they publish a useful failed-run report: `status: "fail"`, `score: 0.0`, zero-scored criteria, and a `critical` finding carrying the error code. `GET .../report` returns `200`.
+- Invalid `config.pass_threshold` (non-numeric or outside 0–100) fails the run before evaluation with a clear `pass_threshold` message and publishes no report (`GET .../report` → `404`); the same applies to other validation-stage errors (unknown scenario, missing run context).
+- All secrets supplied through `scenario.variables` are redacted before storage; reports, traces, and events never contain raw secret values. Secret-leak detection lives in the standalone `backend/app/workflow/security_checks.py` module and emits a critical `secret_exposure` finding when a value reaches persisted artifacts.
 
 Compatibility with the Phase 2 report surface: publishing a workflow run also writes a `ReportSummary` projection into the existing `REPORTS` store, so `GET /api/v1/reports/{report_id}` keeps working for workflow runs (`score`, `run_id`, `summary` are mirrored; the rich detail lives only behind `/test-runs/{run_id}/report`).
 

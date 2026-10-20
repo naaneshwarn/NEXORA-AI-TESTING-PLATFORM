@@ -203,11 +203,19 @@ def test_full_demo_flow_pass_and_fail() -> None:
     assert environment.status_code == 201
     env_id = environment.json()["data"]["environment_id"]
 
-    # Not ready yet: a run bound to it must fail safely.
+    # Not ready yet: a run bound to it must fail safely — and publish a
+    # useful failed-run report (Phase 3 guide acceptance criterion).
     failing = _create_run("crm-read-customer-summary", config={"environment_id": env_id})
     failing_state = client.get(f"/api/v1/test-runs/{failing}").json()["data"]
     assert failing_state["state"] == "failed"
     assert "ready" in failing_state["message"]
+
+    failing_env_report = client.get(f"/api/v1/test-runs/{failing}/report")
+    assert failing_env_report.status_code == 200
+    env_report = failing_env_report.json()["data"]
+    assert env_report["status"] == "fail"
+    assert env_report["score"] == 0.0
+    assert any(finding["code"] == "environment_not_ready" for finding in env_report["findings"])
 
     # Mark ready via the Phase 2 lifecycle endpoint and rerun with a fresh run.
     ready = client.post(f"/api/v1/environments/{env_id}/ready")
