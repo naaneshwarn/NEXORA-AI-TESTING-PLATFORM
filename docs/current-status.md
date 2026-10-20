@@ -1,8 +1,8 @@
 # NEXORA AI Testing Platform — Current Status
 
-**Last Updated:** October 13, 2026  
-**Active Branch:** `feature/synthetic-api`  
-**Latest Commit:** `82646d0` (*Merge pull request #6 from naaneshwarn/chore/project-foundation*)\
+**Last Updated:** October 21, 2026  
+**Active Branch:** `feature/workflow-evaluation-reporting`  
+**Latest Commit:** see `git log` (Work Package D commits `4535298` → HEAD, built on `4703dbc`)\
 **Upstream Base:** `25dab08` (*Publish NEXORA AI Testing Platform source code*)  
 
 ---
@@ -20,6 +20,14 @@ Key milestones delivered on `feature/synthetic-api`:
 6. **Automated Verification**: Complete 38-test automated pytest suite passing across 7 modules (`test_api_contracts.py`, `test_health.py`, `test_protocol_adapters.py`, `test_tracing.py`, `test_crm.py`, `test_auth.py`, `test_streaming.py`), plus full live HTTP lifecycle verification.
 7. **Optional Authentication Dependency**: `backend/app/core/auth.py` inspects `X-API-Key` / `Authorization: Bearer` headers without forcing credentials on anonymous callers, exposes deterministic `invalid-token-test` (401) / `forbidden-token-test` (403) sentinels for denied-access testing, and is attached to the CRM, synthetic agent-execution, and streaming routers.
 8. **SSE Live Trace Streaming (Phase 3)**: `GET /api/v1/test-runs/{run_id}/stream` streams deduplicated `tool_trace` frames and a terminal `run_status` frame over `EventSourceResponse`, with 404 validation, client-disconnect handling, and a 1s non-blocking poll loop.
+
+Key milestones delivered on `feature/workflow-evaluation-reporting` (Work Package D — Rahul):
+9. **Deterministic Workflow Engine**: LangGraph-compatible state machine (`add_node` / `add_conditional_edges` / `compile` / `invoke`) in `backend/app/workflow/graph.py` with cancellation, failure capture, and finalize-once guarantees — zero new dependencies; real LangGraph can slot in later without API changes.
+10. **Scenario Registry & Mock Agent Client**: three deterministic scenarios (`crm-read-customer-summary`, `crm-read-customer-hallucination`, `crm-read-customer-agent-failure`) with an idempotent seed CRM lead, plus a `SyntheticToolAgentClient` supporting correct/hallucinated/error/timeout behaviors.
+11. **Deterministic Evaluation**: weighted scoring (task 40 / factual 40 / trace 20), configurable `pass_threshold` (default 70), secret-leak detection, and the safety rule that any critical finding blocks a pass regardless of score.
+12. **Workflow Orchestration Service**: validate → verify environment → build scenario → invoke agent → evaluate → publish report → finalize, with a run-context registry, idempotent execution (queued-state guard), and a 30s total timeout.
+13. **Workflow API Surface (additive)**: `POST /api/v1/test-runs` auto-executes registered scenarios in the background (legacy `queued` behavior preserved for unknown/missing scenarios), plus `POST /api/v1/test-runs/{run_id}/execute` and `GET /api/v1/test-runs/{run_id}/report` exposing the rich `WorkflowReport`.
+14. **Automated Verification**: full backend suite **96 passing** (38 pre-existing + 58 Work Package D tests across engine, evaluation, service, and API modules), no API keys, no Docker, no network required.
 
 ---
 
@@ -52,6 +60,8 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
 | **Test Runs** | `/api/v1/test-runs` | `POST` | ✅ Operational | Queues scenario test run |
 | **Test Runs** | `/api/v1/test-runs/{run_id}` | `GET` | ✅ Operational | Fetches execution state |
 | **Test Runs** | `/api/v1/test-runs/{run_id}/cancel` | `POST` | ✅ Operational | Cancels active run |
+| **Test Runs** | `/api/v1/test-runs/{run_id}/execute` | `POST` | ✅ Operational | (WP-D) Executes a queued run with a registered scenario; `404` unknown run, `409` non-queued run or unregistered scenario (lists registered ids) |
+| **Workflow Reports** | `/api/v1/test-runs/{run_id}/report` | `GET` | ✅ Operational | (WP-D) Rich `WorkflowReport`: weighted criteria, findings, evidence, threshold; `404` when no report exists |
 | **Events** | `/api/v1/test-runs/{run_id}/events` | `GET` | ✅ Operational | Retrieves tool-call execution events |
 | **Traces** | `/api/v1/test-runs/{run_id}/traces` | `GET` | ✅ Operational | Retrieves redacted tool-call execution traces (`ToolCallTraceResponse`) |
 | **Streaming** | `/api/v1/test-runs/{run_id}/stream` | `GET` | ✅ Operational | Server-Sent Events stream of `tool_trace` frames plus a terminal `run_status` frame (`EventSourceResponse`); `404` for unknown runs |
@@ -106,53 +116,15 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
 ## 5. Testing & Verification Status
 
 ### Automated Pytest Suite
-- **Command**: `python -m pytest` (using `backend/.venv/Scripts/python.exe`)
-- **Result**: **`38 passed`** in 0.98s
-  - `tests/test_api_contracts.py` (4 passed):
-    - `test_agent_registration_and_validation`
-    - `test_test_run_contract_and_events`
-    - `test_environment_and_evaluation_contract`
-    - `test_crm_fault_and_latency_injection`
-  - `tests/test_health.py` (1 passed):
-    - `test_health_endpoint`
-  - `tests/test_protocol_adapters.py` (7 passed):
-    - `test_rest_adapter_round_trip`
-    - `test_openai_adapter_parses_function_payload_and_formats_tool_message`
-    - `test_adapter_factory_defaults_and_aliases`
-    - `test_execute_rest_tool_round_trip`
-    - `test_execute_openai_function_call_returns_tool_message`
-    - `test_execute_normalizes_unknown_tool_and_parse_failures`
-    - `test_execute_rejects_unknown_protocol`
-  - `tests/test_tracing.py` (8 passed):
-    - `test_redact_sensitive_data_masks_keys_recursively`
-    - `test_redact_sensitive_data_scrubs_inline_secrets`
-    - `test_execute_and_trace_tool_persists_redacted_telemetry`
-    - `test_execute_and_trace_tool_captures_failures`
-    - `test_execution_dispatcher_records_and_exposes_traces`
-    - `test_traces_endpoints_handle_missing_records`
-    - `test_execution_dispatcher_writes_tool_call_event_for_run`
-    - `test_execution_dispatcher_writes_failure_tool_call_event`
-  - `tests/test_crm.py` (5 passed):
-    - `test_crm_crud_lifecycle_and_state_changes`
-    - `test_crm_invalid_payloads_rejected_consistently`
-    - `test_crm_missing_resources_return_structured_404`
-    - `test_crm_query_boundary_validation`
-    - `test_crm_repeated_and_concurrent_operations`
-  - `tests/test_auth.py` (9 passed):
-    - `test_optional_auth_allows_anonymous_requests`
-    - `test_optional_auth_accepts_api_key_header`
-    - `test_optional_auth_accepts_bearer_token`
-    - `test_optional_auth_prefers_bearer_token_over_api_key`
-    - `test_optional_auth_simulates_unauthorized_access`
-    - `test_optional_auth_simulates_forbidden_access`
-    - `test_crm_route_allows_anonymous_requests`
-    - `test_crm_route_simulates_unauthorized_access`
-    - `test_execution_route_simulates_forbidden_access`
-  - `tests/test_streaming.py` (4 passed):
-    - `test_stream_unknown_run_returns_404`
-    - `test_stream_emits_run_status_and_terminates_for_terminal_run`
-    - `test_stream_emits_recorded_tool_traces_before_terminal_status`
-    - `test_stream_rejects_denied_access_sentinels`
+- **Command**: `python -m pytest` (system Python 3.13 on this branch; no venv required)
+- **Result**: **`96 passed`** in ~1.6s
+  - Pre-existing Phase 2/3 baseline (38 tests): `test_api_contracts.py` (4), `test_health.py` (1), `test_protocol_adapters.py` (7), `test_tracing.py` (8), `test_crm.py` (5), `test_auth.py` (9), `test_streaming.py` (4).
+  - Work Package D additions (58 tests):
+    - `tests/test_workflow_engine.py` (8): node execution order, conditional edges, cancellation propagation, failure capture, finalize-once semantics, invoke determinism.
+    - `tests/test_workflow_evaluation.py` (16): weighted scoring, threshold configuration/validation, hallucination detection, secret-leak detection, critical-finding safety rule, pass/fail determinism.
+    - `tests/test_workflow_service.py` (20): environment verification, scenario build, idempotent execution, run-context registry, invalid-config failures, report publishing, timeouts, cancellation.
+    - `tests/test_workflow_api.py` (14): auto-execution contract compatibility, manual execute (200/404/409), report endpoint (200/404), Phase 2 `ReportSummary` projection, secret canary absence over HTTP, agent-failure and invalid-threshold HTTP paths, full pass+fail demo flow.
+  - Baseline test names are retained in each pre-existing module docstring; all 38 baseline tests remain unmodified and green.
 
 ### Frontend Vitest Suite (`apps/web`)
 - **Command**: `npm test --workspace @nexora/web` (Vitest 5 + jsdom + Testing Library)
@@ -171,6 +143,7 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
 5. **Tool-Call Tracing & Secret Redaction**: Verified `POST /synthetic/agent/execute/rest?run_id={run_id}` with secret parameter `api_key`; confirmed `GET /test-runs/{run_id}/traces` returns `api_key == "[REDACTED]"` with UTC timestamp, and `GET /test-runs/{run_id}/events` returns the linked `tool_call` event with the redacted payload.
 6. **Optional Authentication**: Verified anonymous (`authenticated: false`), `X-API-Key` and `Bearer` acceptance with token prefixes, Bearer precedence over the API key, and simulated `401` / `403` denied-access responses via the synthetic sentinels — both on an isolated probe route and on the real `/api/v1/leads` and `/api/v1/synthetic/agent/execute/{protocol}` routers.
 7. **SSE Live Trace Streaming**: Verified `GET /test-runs/{run_id}/stream` returns `404` for unknown runs, streams exactly one deduplicated `tool_trace` frame (redacted payload) followed by a terminal `run_status` frame with `"state": "cancelled"` for a cancelled run, and rejects the forbidden sentinel with `403`.
+8. **Work Package D Full Demo (live uvicorn, C8 checkpoint)**: Verified over real HTTP on `127.0.0.1:8000`: health → agent registration → environment creation → run bound to a `provisioning` environment fails safely with a clear message → `POST /environments/{id}/ready` → passing run reaches `passed` with a 100.00 score report → `crm-read-customer-hallucination` run fails with score 60.00 and a `critical/unsupported_fact` finding citing `platinum-vip` → secret canary supplied via `scenario.variables` absent from traces (replaced by `[REDACTED]`) → unknown scenario `"browser regression"` remains `queued`. Server logs showed no 500s, no tracebacks, and no secret material.
 
 ---
 
@@ -191,4 +164,6 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
   - Next: Extend the dependency to the remaining routers (agents, test runs, environments) and enforce real API keys instead of the synthetic sentinels.
   - Transition backend store from in-memory dictionary to persistent storage (PostgreSQL / Redis).
 - **Rahul (Workflows & Evaluation)**:
-  - Connect LangGraph orchestrator and automated test scoring evaluation flows.
+  - ✅ Work Package D delivered on `feature/workflow-evaluation-reporting`: deterministic LangGraph-compatible workflow engine, scenario registry + mock agent client, weighted evaluator with configurable threshold and critical-finding safety rule, orchestration service with cancellation/timeouts/idempotency, and additive API surface (`POST /test-runs/{id}/execute`, `GET /test-runs/{id}/report`, background auto-execution of registered scenarios).
+  - ✅ 96 backend tests passing (58 new); live HTTP demo of the full pass/fail/redaction flow verified; no secrets in traces, reports, or logs.
+  - Next: team review of the additive `store.py` helpers (lead-owned file), then swap the in-repo state machine for real LangGraph (`langgraph` is already pinned) and wire live LLM agent providers behind `agent_client.py` behind the same interface.
