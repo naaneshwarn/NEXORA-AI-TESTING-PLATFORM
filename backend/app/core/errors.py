@@ -7,6 +7,34 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette import status
 
+# Errors returned by validation are JSON-serialized verbatim.  Pydantic echoes
+# the offending input back in each error's ``input`` field, and for a
+# non-JSON body (e.g. ``text/plain``) that value is raw ``bytes`` — which
+# ``json.dumps`` cannot encode.  Without sanitizing, the 422 handler itself
+# raises ``TypeError`` and the client sees a misleading 500.  We coerce any
+# non-JSON-serializable value to a safe, human-readable placeholder so the
+# contract (a well-formed 422 envelope) always holds.
+_MAX_ECHO_BYTES = 256
+
+
+def _safe_json_value(value: Any) -> Any:
+    """Return a JSON-serializable stand-in for an arbitrary value."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            text = bytes(value).decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001 - never let serialization raise
+            return f"<{len(value)} bytes>"
+        if len(text) > _MAX_ECHO_BYTES:
+            text = text[:_MAX_ECHO_BYTES] + "…"
+        return text
+    if isinstance(value, dict):
+        return {str(k): _safe_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_safe_json_value(v) for v in value]
+    return str(value)
+
 
 def _error_payload(code: str, message: str, details: Any | None = None) -> dict[str, Any]:
     return {
@@ -27,7 +55,7 @@ def register_error_handlers(app: FastAPI) -> None:
             content=_error_payload(
                 "validation_error",
                 "Request validation failed",
-                {"errors": exc.errors()},
+                {"errors": _safe_json_value(exc.errors())},
             ),
         )
 

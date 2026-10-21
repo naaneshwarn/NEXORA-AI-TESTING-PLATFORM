@@ -142,6 +142,48 @@ def test_phase2_summary_endpoint_serves_workflow_runs() -> None:
     assert summary.json()["data"]["score"] < 70.0
 
 
+def test_workflow_report_id_is_retrievable_through_reports_route() -> None:
+    """The ``wfreport-…`` ID the API publishes must resolve on /reports/{id}.
+
+    Regression for a real integration seam defect: ``GET /test-runs/{id}/report``
+    returned a ``wfreport-…`` ID that ``GET /reports/{id}`` could not find,
+    because the rich report lives in a separate store from the Phase-2
+    ``ReportSummary`` projection.  The published ID was therefore a dead
+    reference.  The route now falls back to the workflow report store.
+    """
+    run_id = _create_run("crm-read-customer-summary")
+
+    report = client.get(f"/api/v1/test-runs/{run_id}/report").json()["data"]
+    published_id = report["report_id"]
+    assert published_id.startswith("wfreport-")
+
+    fetched = client.get(f"/api/v1/reports/{published_id}")
+    assert fetched.status_code == 200
+    data = fetched.json()["data"]
+    assert data["report_id"] == published_id
+    assert data["run_id"] == run_id
+    assert data["status"] == report["status"]
+    # The rich projection keeps its own contract (criteria/evidence/pass_threshold).
+    assert data["criteria"] and "pass_threshold" in data
+
+
+def test_reports_route_still_serves_phase2_summaries_and_404s_unknown() -> None:
+    """The fallback must not break the Phase-2 contract or unknown lookups."""
+    submission = client.post(
+        "/api/v1/evaluations",
+        json={"run_id": "run-manual", "score": 88.0, "status": "pass", "summary": "manual"},
+    )
+    assert submission.status_code == 201
+    summary_id = submission.json()["data"]["report_id"]
+    assert summary_id.startswith("report-")
+
+    fetched = client.get(f"/api/v1/reports/{summary_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["data"]["summary"] == "manual"
+
+    assert client.get("/api/v1/reports/report-does-not-exist").status_code == 404
+
+
 def test_secret_variables_never_appear_in_http_responses() -> None:
     secret = "http-secret-canary-777"
     run_id = _create_run(
