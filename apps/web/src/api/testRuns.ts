@@ -11,6 +11,23 @@ export const API_BASE_URL = String(import.meta.env.VITE_API_BASE_URL ?? 'http://
 
 export type RunState = TestRunStatus | 'cancelled' | 'completed';
 
+/**
+ * Identifier of the deterministic CRM scenario the dashboard drives by default.
+ *
+ * The backend only schedules workflow execution when a run is bound to a
+ * registered scenario (see `POST /api/v1/test-runs`); a scenario-less run stays
+ * `queued` forever and its trace stream stays silent. The dashboard therefore
+ * pins the platform's built-in deterministic scenario so "Create test run"
+ * actually executes and streams.
+ */
+export const DEFAULT_SCENARIO_NAME = 'crm-read-customer-summary';
+
+/** Scenario binding sent with a create-run request. */
+export interface ScenarioConfig {
+  name: string;
+  variables?: Record<string, unknown>;
+}
+
 export interface TestRunDetail {
   run_id: string;
   suite_name: string;
@@ -27,6 +44,7 @@ export interface CreateTestRunInput {
   suite_name: string;
   environment?: string;
   target_agents?: string[];
+  scenario?: ScenarioConfig;
 }
 
 interface ApiError {
@@ -62,6 +80,9 @@ export async function createTestRun(input: CreateTestRunInput): Promise<TestRunD
     body: JSON.stringify({
       environment: 'local',
       target_agents: [],
+      // Bind the run to a registered scenario so the backend schedules workflow
+      // execution; otherwise the run would remain `queued` with no trace stream.
+      scenario: { name: DEFAULT_SCENARIO_NAME, variables: {} },
       ...input,
     }),
   });
