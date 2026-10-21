@@ -3,14 +3,15 @@
 **Owner:** Rahul (Workflows & Evaluation)
 **Branch:** `feature/workflow-evaluation-reporting`
 **Base:** `4703dbc` (*Merge pull request #7 — feature/synthetic-api*)
-**Status:** ✅ Complete, all fixes applied, **112 tests passing**
+**Status:** ✅ Complete, all fixes applied, **launch-hardened, 127 tests passing**
 **Last updated:** October 21, 2026
 
 > This document is the single consolidated record of *everything* done for Work Package D
 > (LangGraph workflow, scenarios, simulated-user/advisory checks, evaluation, scoring, and
 > reporting) as required by the Phase 3 Implementation Guide. It covers the original build,
 > the 10 verification checkpoints, the live demonstration, the professional audit, the
-> follow-up fixes, test evidence, and the outstanding team-coordination items.
+> follow-up fixes, the **launch-hardening pass**, test evidence, and the outstanding
+> team-coordination items.
 
 ---
 
@@ -29,6 +30,7 @@ Platform. Delivered on one branch:
 | **Orchestration service** | `validate → verify_environment → build_scenario → invoke_agent → evaluate → publish_report → cleanup → finalize`, with a run-context registry, idempotent execution (queued-state guard), and a 30 s total timeout. |
 | **Reporting** | Rich `WorkflowReport` (criteria, findings, evidence, threshold, duration) via new `GET /api/v1/test-runs/{run_id}/report`, plus a `ReportSummary` projection so the Phase 2 `GET /api/v1/reports/{report_id}` endpoint keeps working unchanged. |
 | **API surface (additive)** | `POST /api/v1/test-runs/{run_id}/execute` (404 unknown run, 409 non-queued or unregistered scenario) and background auto-execution of registered scenarios on `POST /api/v1/test-runs` (legacy `queued` response preserved). |
+| **Launch runtime** | Structured logging, **durable run-context persistence** (survives restart), settings-driven operational config, a concurrency limiter, process metrics, an additive readiness endpoint, and **startup recovery** of runs interrupted by a crash. See §11. |
 
 **Out of scope:** the separate *Aegis Quant* blueprint — not part of Work Package D.
 
@@ -45,19 +47,26 @@ Platform. Delivered on one branch:
 | `backend/app/workflow/evaluator.py` | Scoring, threshold validation, findings, pass/fail decision. |
 | `backend/app/workflow/security_checks.py` | **Standalone security evaluator** (added during the audit fixes). |
 | `backend/app/workflow/service.py` | Orchestration service and graph wiring. |
+| `backend/app/workflow/runtime.py` | **Launch runtime layer** (added during launch hardening): structured logging, durable `RunContextStore`, `ConcurrencyLimiter`, `WorkflowMetrics`, `recover_interrupted_runs`. |
+| `backend/app/api/routes/workflow.py` | **Additive** `GET /api/v1/workflow/readiness` endpoint (workflow-owned; shared `/health` untouched). |
 | `backend/app/schemas/workflow_report.py` | `WorkflowReport`, `CriterionScore`, `Finding`, `ReportEvidence` (additive new schema file). |
 | `backend/tests/test_workflow_engine.py` | Engine tests, incl. cleanup guarantees. |
 | `backend/tests/test_workflow_evaluation.py` | Evaluator/scoring tests. |
 | `backend/tests/test_security_checks.py` | Security module tests (added during the audit fixes). |
 | `backend/tests/test_workflow_service.py` | Orchestration tests. |
 | `backend/tests/test_workflow_api.py` | HTTP-level tests. |
+| `backend/tests/test_workflow_runtime.py` | **Launch-runtime tests** (15): logging, durable store (incl. BOM/corruption tolerance), concurrency, metrics, readiness, recovery. |
+| `backend/tests/conftest.py` | Isolates the durable store into a temp dir per session so tests never write into the repo. |
 
 ### Modified files (additive only)
 | File | Change |
 | :--- | :--- |
 | `backend/app/core/store.py` | **Lead-owned file — additive-only, flagged for review**: `WORKFLOW_REPORTS`, `update_test_run_state`, `save_workflow_report`, `get_workflow_report`, `get_workflow_report_for_run`. |
+| `backend/app/core/config.py` | **Additive settings** (workflow-owned): `workflow_total_timeout_seconds`, `workflow_agent_timeout_seconds`, `workflow_default_pass_threshold`, `workflow_max_concurrent_runs`, `workflow_state_dir`. |
+| `backend/app/main.py` | Modern `lifespan` startup (logging config + run recovery), workflow router registration. |
 | `backend/app/api/routes/test_runs.py` | Background auto-execution for registered scenarios; `POST .../execute`. |
 | `backend/app/api/routes/evaluations.py` | `GET /api/v1/test-runs/{run_id}/report`. |
+| `.env.example`, `.gitignore` | Document `WORKFLOW_*` variables; ignore `.workflow_state/`. |
 | `docs/api-contracts.md`, `docs/current-status.md`, `docs/changes.md` | Contract, status, and change-log documentation. |
 
 **No existing file in `app/schemas/` was modified.** All shared-contract changes are additive
@@ -172,7 +181,7 @@ surfaced four real defects, all fixed:
 
 ```
 python -m pytest -q
-112 passed, 5 warnings in ~1.4s
+127 passed, 5 warnings in ~1.4s
 ```
 
 | Module | Tests | Covers |
@@ -183,7 +192,8 @@ python -m pytest -q
 | `test_security_checks.py` | 6 | standalone security evaluator |
 | `test_workflow_service.py` | 25 | environment, idempotency, config errors, reports, timeouts, crash-recovery report boundary, cancellation, cleanup, injectable agent client |
 | `test_workflow_api.py` | 14 | execute/report endpoints, contract compatibility, secret canary, demo flow |
-| **Total** | **112** | **74 Work Package D tests added** |
+| `test_workflow_runtime.py` | 15 | structured logging, durable run-context store (reload, atomicity, BOM/corruption tolerance), concurrency limiter, metrics, readiness, startup recovery |
+| **Total** | **127** | **89 Work Package D tests added** |
 
 Guarantees: **no API keys, no Docker, no network** required; fully deterministic (no clocks or
 randomness in assertions).
@@ -221,7 +231,47 @@ All commits are **local** on `feature/workflow-evaluation-reporting` and **have 
 
 ---
 
-## 9. Outstanding team-coordination items (not code defects)
+## 9. Launch hardening (production-grade pass)
+
+After the functional work was complete, Work Package D received a dedicated
+**launch-hardening pass** so the subsystem is production-realistic rather than a
+test-only demo. Everything below lives inside `app/workflow/` (workflow-owned) plus
+one additive settings block; **no shared schema or lead-owned store function was
+changed**.
+
+| Capability | Implementation | Verified by |
+| :--- | :--- | :--- |
+| **Structured logging** | `runtime.configure_logging` / `get_logger`; the service and startup emit greppable `nexora.workflow.*` lines (`run context registered`, `workflow run starting/finished`, timeout/crash errors). No secrets are logged. | `test_workflow_runtime.py`, live server log |
+| **Durable run-context store** | `RunContextStore` writes an atomic JSON snapshot (temp file + `os.replace`) and reloads it on startup, so a queued run keeps its scenario binding across a process restart. Tolerates a UTF-8 BOM and a corrupt snapshot (logs a warning, starts empty). | `test_run_context_store_survives_reload`, `..._tolerates_utf8_bom`, `..._recovers_from_corruption`; **live restart proof** |
+| **Settings-driven config** | `workflow_total_timeout_seconds`, `workflow_agent_timeout_seconds`, `workflow_default_pass_threshold`, `workflow_max_concurrent_runs`, `workflow_state_dir` — all env-overridable (`WORKFLOW_*`). | settings reload test + **live env-override proof** |
+| **Concurrency limiter** | `ConcurrencyLimiter` bounds in-flight runs via an async semaphore so a burst degrades gracefully. | `test_concurrency_limiter_bounds_in_use`; live 5-run burst |
+| **Metrics** | `WorkflowMetrics` counters (`started/finished/passed/failed/cancelled/rejected/recovered`) exposed for operators. | `test_executing_a_run_updates_metrics_and_releases_context` |
+| **Readiness endpoint** | `GET /api/v1/workflow/readiness` reports store reachability, pending contexts, and metrics (additive; shared `/health` untouched). | live HTTP |
+| **Startup recovery** | On `lifespan` startup, runs left `queued`/`running` by a dead process are terminalized as failed, so none dangle. | `test_recover_startup_runs_terminalizes_stuck_runs`, `test_recovery_is_idempotent` |
+| **Context lifecycle** | Terminal runs release both the cache entry and the durable record, so the snapshot cannot grow unbounded. | live: `pending_run_contexts` returns to 0 after runs finish |
+
+### Live launch verification (real server, real HTTP)
+
+1. `GET /api/v1/workflow/readiness` → `ready: true`, resolved state path, full metrics.
+2. Happy-path run → `passed`; metrics moved `started/finished/passed = 1`.
+3. **Restart proof:** a durable context written before a restart is reloaded by a
+   *fresh process* (`pending_run_contexts = 1`, metrics reset to 0).
+4. **Env-override proof:** `WORKFLOW_STATE_DIR=launch_env_state` changed the resolved
+   path, and `WORKFLOW_DEFAULT_PASS_THRESHOLD=95` appeared in both the run message
+   (*"against threshold 95.00"*) and the persisted `WorkflowReport.pass_threshold`.
+5. A 5-run burst all reached terminal state under the concurrency limit; all contexts
+   were released afterwards.
+6. Traces/events carried only synthetic values (redaction intact).
+
+> **Bug found and fixed during launch verification:** the durable store's reader used
+> strict UTF-8, so a snapshot written by a Windows shell (which prepends a UTF-8 BOM)
+> was treated as corrupt and silently started empty. The reader now uses `utf-8-sig`,
+> with a regression test. This was caught only because verification exercised a real
+> restart against a real on-disk file.
+
+---
+
+## 10. Outstanding team-coordination items (not code defects)
 
 1. **`store.py` review** — the file is lead-owned; the additive workflow helpers still need team
    sign-off.
@@ -234,7 +284,7 @@ All commits are **local** on `feature/workflow-evaluation-reporting` and **have 
 
 ---
 
-## 10. Suggested next steps (beyond WP-D scope)
+## 11. Suggested next steps (beyond WP-D scope)
 
 - Swap the in-repo state machine for real LangGraph. The guide says "use LangGraph **if
   appropriate**"; the deliberate decision here was an in-repo engine implementing the compatible

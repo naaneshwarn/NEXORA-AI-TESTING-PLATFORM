@@ -19,5 +19,17 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
 
+    # -- Workflow execution (Rahul / Work Package D) -----------------------
+    # Operational knobs for the workflow subsystem.  All are environment
+    # overridable (prefix-free names map to WORKFLOW_* env vars via the field
+    # name), so launch deployments can tune them without code changes.
+    workflow_total_timeout_seconds: float = Field(default=30.0, gt=0.0)
+    workflow_agent_timeout_seconds: float = Field(default=10.0, gt=0.0)
+    workflow_default_pass_threshold: float = Field(default=70.0, ge=0.0, le=100.0)
+    workflow_max_concurrent_runs: int = Field(default=4, ge=1)
+    # Durable directory for run-context snapshots so queued runs survive a
+    # process restart.  Relative paths resolve against the backend directory.
+    workflow_state_dir: str = Field(default=".workflow_state")
+
 
 settings = Settings()

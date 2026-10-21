@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
+from app.core.config import settings
 from app.core.store import (
     get_agent,
     get_environment,
@@ -54,6 +55,15 @@ from app.workflow.evaluator import (
     validate_pass_threshold,
 )
 from app.workflow.graph import WorkflowGraph, WorkflowState
+from app.workflow.runtime import (
+    RunContextRecord,
+    RunContextStore,
+    get_logger,
+    get_metrics,
+    incr,
+    recover_interrupted_runs,
+    resolve_state_path,
+)
 from app.workflow.scenarios import (
     ScenarioDefinition,
     ensure_seed_lead,
@@ -61,9 +71,20 @@ from app.workflow.scenarios import (
     list_scenario_ids,
 )
 
-# Hard ceiling for one workflow run; agent turns have their own tighter timeout.
+_log = get_logger("service")
+
+# Launch configuration is settings-driven (env overridable); the module
+# constants remain as defaults so nothing that imported them breaks.
 WORKFLOW_TOTAL_TIMEOUT_SECONDS = 30.0
 DEFAULT_AGENT_TIMEOUT_SECONDS = 10.0
+
+
+def _total_timeout() -> float:
+    return settings.workflow_total_timeout_seconds
+
+
+def _default_agent_timeout() -> float:
+    return settings.workflow_agent_timeout_seconds
 
 
 @dataclass
@@ -82,9 +103,45 @@ class RunContext:
     pass_threshold: float = DEFAULT_PASS_THRESHOLD
     agent_timeout_seconds: float = DEFAULT_AGENT_TIMEOUT_SECONDS
 
+    def to_record(self) -> RunContextRecord:
+        return RunContextRecord(
+            run_id=self.run_id,
+            scenario_id=self.scenario_id,
+            variables=dict(self.variables),
+            agent_ids=list(self.agent_ids),
+            environment_id=self.environment_id,
+            pass_threshold=self.pass_threshold,
+            agent_timeout_seconds=self.agent_timeout_seconds,
+        )
 
-# Run inputs captured at creation time (in-memory, like the rest of the MVP store).
+    @classmethod
+    def from_record(cls, record: RunContextRecord) -> "RunContext":
+        return cls(
+            run_id=record.run_id,
+            scenario_id=record.scenario_id,
+            variables=dict(record.variables),
+            agent_ids=list(record.agent_ids),
+            environment_id=record.environment_id,
+            pass_threshold=record.pass_threshold,
+            agent_timeout_seconds=record.agent_timeout_seconds,
+        )
+
+
+# Durable run-context store: survives a process restart so a queued run keeps
+# its scenario binding.  ``RUN_CONTEXTS`` remains a process-local cache kept in
+# sync with the store so existing callers (and tests) can read it directly.
+_CONTEXT_STORE: RunContextStore | None = None
 RUN_CONTEXTS: dict[str, RunContext] = {}
+
+
+def _context_store() -> RunContextStore:
+    global _CONTEXT_STORE
+    if _CONTEXT_STORE is None:
+        _CONTEXT_STORE = RunContextStore(resolve_state_path(settings.workflow_state_dir))
+        # Warm the in-process cache from the durable snapshot.
+        for record in _CONTEXT_STORE.all():
+            RUN_CONTEXTS[record.run_id] = RunContext.from_record(record)
+    return _CONTEXT_STORE
 
 
 def build_run_context(run_id: str, payload: RunCreateRequest) -> RunContext | None:
@@ -104,6 +161,8 @@ def build_run_context(run_id: str, payload: RunCreateRequest) -> RunContext | No
             variables=variables,
             agent_ids=list(payload.target_agents or []),
             environment_id=str(config["environment_id"]) if config.get("environment_id") else None,
+            pass_threshold=settings.workflow_default_pass_threshold,
+            agent_timeout_seconds=_default_agent_timeout(),
         )
         if "pass_threshold" in config:
             try:
@@ -123,11 +182,33 @@ def build_run_context(run_id: str, payload: RunCreateRequest) -> RunContext | No
 
 
 def register_run_context(context: RunContext) -> None:
+    """Persist a run context durably and cache it in-process."""
     RUN_CONTEXTS[context.run_id] = context
+    _context_store().put(context.to_record())
+    _log.info(
+        "run context registered",
+        extra={"run_id": context.run_id, "scenario_id": context.scenario_id},
+    )
 
 
 def get_run_context(run_id: str) -> RunContext | None:
-    return RUN_CONTEXTS.get(run_id)
+    cached = RUN_CONTEXTS.get(run_id)
+    if cached is not None:
+        return cached
+    # Fall back to durable storage (for contexts registered before a restart
+    # within the same snapshot, or written by another worker).
+    record = _context_store().get(run_id)
+    if record is None:
+        return None
+    context = RunContext.from_record(record)
+    RUN_CONTEXTS[run_id] = context
+    return context
+
+
+def release_run_context(run_id: str) -> None:
+    """Drop a finished run's context from both cache and durable storage."""
+    RUN_CONTEXTS.pop(run_id, None)
+    _context_store().pop(run_id)
 
 
 def _utc_now() -> datetime:
@@ -169,7 +250,7 @@ class WorkflowRunExecutor:
         # live provider implementing the WorkflowAgentClient protocol can be
         # passed in without changing this service (see agent_client.py).
         self.agent_client: WorkflowAgentClient = agent_client or SyntheticToolAgentClient()
-        self.context = RUN_CONTEXTS.get(run_id)
+        self.context = get_run_context(run_id)
         self.scenario: ScenarioDefinition | None = None
         self.agent_outcome: AgentTurnOutcome | None = None
         self.evaluation: EvaluationOutcome | None = None
@@ -568,8 +649,15 @@ class WorkflowRunExecutor:
     async def execute(self) -> dict[str, Any]:
         run = get_test_run(self.run_id)
         if run is None:
+            incr("rejected")
+            _log.warning("execute rejected: run not found", extra={"run_id": self.run_id})
             return {"run_id": self.run_id, "executed": False, "reason": "run_not_found"}
         if run.state != "queued":
+            incr("rejected")
+            _log.info(
+                "execute rejected: run not queued",
+                extra={"run_id": self.run_id, "state": run.state},
+            )
             return {"run_id": self.run_id, "executed": False, "reason": f"run_is_{run.state}"}
 
         graph = self._build_graph()
@@ -584,10 +672,17 @@ class WorkflowRunExecutor:
             should_abort=should_abort,
         )
 
+        timeout = _total_timeout()
+        incr("started")
+        _log.info(
+            "workflow run starting",
+            extra={"run_id": self.run_id, "timeout_seconds": timeout},
+        )
+
         try:
-            await asyncio.wait_for(graph.invoke(state), timeout=WORKFLOW_TOTAL_TIMEOUT_SECONDS)
+            await asyncio.wait_for(graph.invoke(state), timeout=timeout)
         except TimeoutError:
-            message = f"Workflow exceeded the {WORKFLOW_TOTAL_TIMEOUT_SECONDS:.0f}s total timeout."
+            message = f"Workflow exceeded the {timeout:.0f}s total timeout."
             # The graph was cut off before finalize, so publish the failed-run
             # report here too (the report is still possible when the scenario
             # was resolved before the timeout).
@@ -599,6 +694,8 @@ class WorkflowRunExecutor:
                 "Workflow timed out and was failed safely.",
                 {"code": "workflow_timeout", "report_id": self.report_id},
             )
+            self._finish("failed")
+            _log.error("workflow run timed out", extra={"run_id": self.run_id, "timeout_seconds": timeout})
             return {
                 "run_id": self.run_id,
                 "executed": True,
@@ -615,6 +712,8 @@ class WorkflowRunExecutor:
                 "Workflow crashed and was failed safely.",
                 {"code": "workflow_crash", "report_id": self.report_id},
             )
+            self._finish("failed")
+            _log.exception("workflow run crashed safely", extra={"run_id": self.run_id})
             return {
                 "run_id": self.run_id,
                 "executed": True,
@@ -623,13 +722,39 @@ class WorkflowRunExecutor:
             }
 
         final_run = get_test_run(self.run_id)
+        final_state = final_run.state if final_run else "unknown"
+        self._finish(final_state)
+        _log.info(
+            "workflow run finished",
+            extra={
+                "run_id": self.run_id,
+                "state": final_state,
+                "report_id": self.report_id,
+                "score": self.evaluation.score if self.evaluation else None,
+            },
+        )
         return {
             "run_id": self.run_id,
             "executed": True,
-            "state": final_run.state if final_run else "unknown",
+            "state": final_state,
             "report_id": self.report_id,
             "summary_report_id": self.summary_report_id,
         }
+
+    def _finish(self, state: str) -> None:
+        """Record terminal metrics and release the run context.
+
+        Contexts are only needed while a run is queued/executing; once a run is
+        terminal the durable snapshot no longer needs to carry it.
+        """
+        incr("finished")
+        if state == "passed":
+            incr("passed")
+        elif state == "cancelled":
+            incr("cancelled")
+        else:
+            incr("failed")
+        release_run_context(self.run_id)
 
 
 async def execute_workflow_run(run_id: str) -> dict[str, Any]:
@@ -638,5 +763,61 @@ async def execute_workflow_run(run_id: str) -> dict[str, Any]:
     The executor's ``queued``-state guard is the single source of truth for
     idempotency: a run that already executed (or was cancelled) is terminal
     and can never start again.
+
+    Execution is bounded by the process-wide concurrency limiter so a burst of
+    run creations degrades gracefully instead of exhausting the event loop.
     """
-    return await WorkflowRunExecutor(run_id).execute()
+    from app.workflow.runtime import get_limiter
+
+    async with get_limiter().slot():
+        return await WorkflowRunExecutor(run_id).execute()
+
+
+def workflow_readiness() -> dict[str, Any]:
+    """Readiness snapshot for the workflow subsystem (used by health checks).
+
+    Reports whether the durable context store is reachable and exposes the
+    process metrics so operators can confirm the subsystem is live.
+    """
+    try:
+        store = _context_store()
+        pending = len(store)
+        store_ok = True
+        path = str(store.path)
+    except Exception:  # noqa: BLE001 - readiness must never raise
+        pending = 0
+        store_ok = False
+        path = None
+    metrics = get_metrics().snapshot()
+    return {
+        "ready": store_ok,
+        "state_store_path": path,
+        "pending_run_contexts": pending,
+        "metrics": metrics,
+    }
+
+
+def recover_startup_runs() -> int:
+    """Terminalize runs interrupted by a previous process crash.
+
+    Called from application startup.  Any run left ``queued``/``running`` by a
+    dead process is marked failed so it can never dangle in a non-terminal
+    state; its stale context is released at the same time.
+    """
+    from app.core.store import TEST_RUNS
+
+    terminal = {"passed", "failed", "cancelled", "completed"}
+
+    def get_runs():
+        return list(TEST_RUNS.values())
+
+    def is_terminal(state: str) -> bool:
+        return state in terminal
+
+    def update_state(run_id: str, message: str) -> None:
+        update_test_run_state(run_id, "failed", message, mark_completed=True)
+        release_run_context(run_id)
+
+    return recover_interrupted_runs(
+        get_runs=get_runs, is_terminal=is_terminal, update_state=update_state
+    )

@@ -264,6 +264,33 @@ Evaluation rules (implemented in `backend/app/workflow/evaluator.py`):
 
 Compatibility with the Phase 2 report surface: publishing a workflow run also writes a `ReportSummary` projection into the existing `REPORTS` store, so `GET /api/v1/reports/{report_id}` keeps working for workflow runs (`score`, `run_id`, `summary` are mirrored; the rich detail lives only behind `/test-runs/{run_id}/report`).
 
+### 8. Workflow subsystem readiness and metrics
+
+| Method | Path | Auth | Response | Statuses | Owner |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| GET | `/api/v1/workflow/readiness` | none | `ApiEnvelope[object]` | 200 | Rahul |
+
+Additive, workflow-owned observability endpoint. The shared Phase 2 `GET /api/v1/health` contract is unchanged.
+
+Response `data`:
+
+```jsonc
+{
+  "ready": true,                        // durable run-context store reachable
+  "state_store_path": "...run_contexts.json",
+  "pending_run_contexts": 0,            // queued/running contexts held durably
+  "metrics": {
+    "started": 0, "finished": 0, "passed": 0, "failed": 0,
+    "cancelled": 0, "rejected": 0, "recovered": 0
+  }
+}
+```
+
+- `ready` is `true` when the durable store loaded successfully; the endpoint never raises (a store failure reports `ready: false`).
+- Metrics are process-lifetime counters: `rejected` counts executions refused because the run was not queued/found; `recovered` counts runs terminalized by startup recovery.
+- Operational configuration is settings-driven and env-overridable: `WORKFLOW_TOTAL_TIMEOUT_SECONDS`, `WORKFLOW_AGENT_TIMEOUT_SECONDS`, `WORKFLOW_DEFAULT_PASS_THRESHOLD`, `WORKFLOW_MAX_CONCURRENT_RUNS`, `WORKFLOW_STATE_DIR`.
+- On startup the service recovers runs left `queued`/`running` by a previous process (marked `failed`) and logs the workflow subsystem as ready.
+
 ## Shared contract decisions pending team approval
 
 - Whether run lifecycle should expose a richer state machine beyond queued/running/passed/failed/cancelled.
