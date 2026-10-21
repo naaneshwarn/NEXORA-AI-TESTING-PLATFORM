@@ -27,8 +27,9 @@ Key milestones delivered on `feature/workflow-evaluation-reporting` (Work Packag
 11. **Deterministic Evaluation**: weighted scoring (task 40 / factual 40 / trace 20), configurable `pass_threshold` (default 70), secret-leak detection, and the safety rule that any critical finding blocks a pass regardless of score.
 12. **Workflow Orchestration Service**: validate → verify environment → build scenario → invoke agent → evaluate → publish report → finalize, with a run-context registry, idempotent execution (queued-state guard), and a 30s total timeout.
 13. **Workflow API Surface (additive)**: `POST /api/v1/test-runs` auto-executes registered scenarios in the background (legacy `queued` behavior preserved for unknown/missing scenarios), plus `POST /api/v1/test-runs/{run_id}/execute` and `GET /api/v1/test-runs/{run_id}/report` exposing the rich `WorkflowReport`.
-14. **Automated Verification**: full backend suite **109 passing** (38 pre-existing + 71 Work Package D tests across engine, evaluation, security, service, and API modules), no API keys, no Docker, no network required.
-15. **Professional Audit & Hardening (post-review)**: three gaps found in a self-audit were fixed — (a) environment failures now publish a useful failed-run report (guide acceptance criterion), (b) an explicit `cleanup` node runs exactly once before finalize on **every** exit path (success, node failure, routing error, cancellation), and (c) secret-leak detection was extracted from `evaluator.py` into a separate, independently selectable `security_checks.py` module. Full detail in [`docs/work-package-d-summary.md`](work-package-d-summary.md).
+14. **Automated Verification**: full backend suite **112 passing** (38 pre-existing + 74 Work Package D tests across engine, evaluation, security, service, and API modules), no API keys, no Docker, no network required.
+15. **Professional Audit & Hardening (post-review)**: three gaps found in a self-audit were fixed — (a) environment failures now publish a useful failed-run report (guide acceptance criterion), (b) an explicit `cleanup` node runs exactly once before finalize on **every** exit path (success, node failure, routing error, cancellation), and (c) secret-leak detection was extracted from `evaluator.py` into a separate, independently selectable `security_checks.py` module.
+16. **Second Audit Round (independent)**: a re-verification of all 11 guide requirements found and fixed four real defects — a false "langgraph already pinned" doc claim, a hardcoded (non-injectable) agent client, duplicated secret-key normalization, and an unhandled pre-finalize crash/timeout report boundary (now reports when a scenario exists, stays report-less when it doesn't). The `agent_client` seam is now injectable for Naaneshwar's `TargetAgent`. Full detail in [`docs/work-package-d-summary.md`](work-package-d-summary.md).
 
 ---
 
@@ -118,13 +119,13 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
 
 ### Automated Pytest Suite
 - **Command**: `python -m pytest` (system Python 3.13 on this branch; no venv required)
-- **Result**: **`109 passed`** in ~1.3s
+- **Result**: **`112 passed`** in ~1.4s
   - Pre-existing Phase 2/3 baseline (38 tests): `test_api_contracts.py` (4), `test_health.py` (1), `test_protocol_adapters.py` (7), `test_tracing.py` (8), `test_crm.py` (5), `test_auth.py` (9), `test_streaming.py` (4).
-  - Work Package D additions (71 tests):
+  - Work Package D additions (74 tests):
     - `tests/test_workflow_engine.py` (13): node execution order, conditional edges, cancellation propagation, failure capture, finalize-once semantics, invoke determinism, **cleanup-runs-exactly-once on success/failure/cancellation paths**, cleanup definition validation.
     - `tests/test_workflow_evaluation.py` (16): weighted scoring, threshold configuration/validation, hallucination detection, secret-leak detection, critical-finding safety rule, pass/fail determinism.
-    - `tests/test_security_checks.py` (7): standalone security evaluator — sensitive/aliased key extraction, detection across traces/summary/record, non-sensitive variables never flagged, critical `secret_exposure` severity, evaluator re-export compatibility.
-    - `tests/test_workflow_service.py` (23): environment verification (**incl. failed-run report publication**), scenario build, idempotent execution, run-context registry, invalid-config failures (report-less by contract), report publishing, timeouts, cancellation, **cleanup event on success and failure paths**.
+    - `tests/test_security_checks.py` (6): standalone security evaluator — sensitive/aliased key extraction, detection across traces/summary/record, non-sensitive variables never flagged, critical `secret_exposure` severity, evaluator re-export compatibility.
+    - `tests/test_workflow_service.py` (25): environment verification (**incl. failed-run report publication**), scenario build, idempotent execution, run-context registry, invalid-config failures (report-less by contract), report publishing, timeouts, **pre-finalize crash/timeout report boundary**, cancellation, **cleanup event on success and failure paths**, **injectable agent client seam**.
     - `tests/test_workflow_api.py` (14): auto-execution contract compatibility, manual execute (200/404/409), report endpoint (200/404), Phase 2 `ReportSummary` projection, secret canary absence over HTTP, agent-failure and invalid-threshold HTTP paths, full pass+fail demo flow **incl. the environment-failure report**.
   - Baseline test names are retained in each pre-existing module docstring; all 38 baseline tests remain unmodified and green.
 
@@ -167,6 +168,7 @@ All endpoints are versioned under `/api/v1` (except the root `/health` ping) usi
   - Transition backend store from in-memory dictionary to persistent storage (PostgreSQL / Redis).
 - **Rahul (Workflows & Evaluation)**:
   - ✅ Work Package D delivered on `feature/workflow-evaluation-reporting`: deterministic LangGraph-compatible workflow engine, scenario registry + mock agent client, weighted evaluator with configurable threshold and critical-finding safety rule, orchestration service with cancellation/timeouts/idempotency, and additive API surface (`POST /test-runs/{id}/execute`, `GET /test-runs/{id}/report`, background auto-execution of registered scenarios).
-  - ✅ 109 backend tests passing (71 new); live HTTP demo of the full pass/fail/redaction flow verified; no secrets in traces, reports, or logs.
+  - ✅ 112 backend tests passing (74 new); live HTTP demo of the full pass/fail/redaction flow verified; no secrets in traces, reports, or logs.
   - ✅ Post-audit hardening: environment-failure reports, explicit cleanup node on all exit paths, and a standalone `security_checks` module (see [`docs/work-package-d-summary.md`](work-package-d-summary.md)).
-  - Next: team review of the additive `store.py` helpers (lead-owned file), then swap the in-repo state machine for real LangGraph (`langgraph` is already pinned) and wire live LLM agent providers behind `agent_client.py` behind the same interface.
+  - ✅ Second independent audit round: fixed a false dependency doc claim, made the agent client injectable for Naaneshwar's `TargetAgent`, de-duplicated secret-key normalization, and pinned the pre-finalize crash/timeout report boundary with tests.
+  - Next: team review of the additive `store.py` helpers (lead-owned file), then optionally swap the in-repo state machine for real LangGraph (not currently a declared dependency — deliberate zero-dependency choice; pin `langgraph` in `backend/requirements.txt` first) and wire live LLM agent providers by injecting a `WorkflowAgentClient` implementation into `WorkflowRunExecutor`.\n  - The `agent_client` constructor argument is the ready-made integration seam for Naaneshwar's `TargetAgent` interface — no service changes needed when that lands.

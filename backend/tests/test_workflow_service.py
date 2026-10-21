@@ -175,6 +175,100 @@ def test_agent_timeout_is_normalized_and_reported() -> None:
         SCENARIOS.pop("crm-read-customer-summary-timeout", None)
 
 
+def test_workflow_level_crash_publishes_a_failed_report(monkeypatch) -> None:
+    """A crash that cuts the graph off before finalize still reports where possible.
+
+    "Where possible" is precise: a report needs the scenario resolved.  We
+    therefore run the real validate + build_scenario nodes on the executor the
+    service will use, then make the compiled graph blow up on ``invoke`` —
+    proving the recovery path publishes a failed report once a scenario exists.
+    """
+    from app.workflow.graph import CompiledWorkflow
+    from app.workflow.scenarios import get_scenario
+    from app.workflow.service import WorkflowRunExecutor
+
+    run_id = _make_run("crm-read-customer-summary")
+
+    async def exploding_invoke(self, state):
+        raise RuntimeError("synthetic graph crash")
+
+    real_init = WorkflowRunExecutor.__init__
+
+    def recording_init(self, run_id, agent_client=None):
+        real_init(self, run_id, agent_client)
+        # Simulate having passed the validate/build_scenario stage (scenario
+        # resolved) without mutating run state, then let invoke crash.
+        self.scenario = get_scenario(self.context.scenario_id) if self.context else None
+        assert self.scenario is not None
+
+    monkeypatch.setattr(WorkflowRunExecutor, "__init__", recording_init)
+    monkeypatch.setattr(CompiledWorkflow, "invoke", exploding_invoke, raising=True)
+
+    result = _execute(run_id)
+
+    assert result["state"] == "failed"
+    report = get_workflow_report_for_run(run_id)
+    assert report is not None
+    assert report["status"] == "fail"
+    assert any(finding["code"] == "workflow_crash" for finding in report["findings"])
+
+
+def test_crash_before_scenario_resolution_stays_report_less(monkeypatch) -> None:
+    """A crash before a scenario exists cannot produce a report; that is intended."""
+    from app.workflow.graph import CompiledWorkflow
+
+    run_id = _make_run("crm-read-customer-summary")
+
+    async def exploding_invoke(self, state):
+        raise RuntimeError("synthetic graph crash")
+
+    monkeypatch.setattr(CompiledWorkflow, "invoke", exploding_invoke, raising=True)
+
+    result = _execute(run_id)
+
+    assert result["state"] == "failed"
+    assert get_workflow_report_for_run(run_id) is None
+
+
+def test_agent_client_is_injectable() -> None:
+    """The WorkflowAgentClient seam accepts any compatible implementation."""
+    import asyncio as _asyncio
+
+    from app.workflow.agent_client import AgentTurnOutcome
+    from app.workflow.service import WorkflowRunExecutor
+    from app.workflow.scenarios import get_scenario
+
+    calls: list[str] = []
+
+    class RecordingClient:
+        async def run_turn(self, run_id, tool_name, parameters, behavior, timeout_seconds, **kwargs):
+            calls.append(tool_name)
+            return AgentTurnOutcome(
+                call_id="injected-call",
+                tool_name=tool_name,
+                success=True,
+                summary="Summary — injected.",
+                record={"name": "Injected", "email": "i@nexora.test", "status": "new"},
+                error=None,
+                execution_time_ms=1.0,
+            )
+
+    run_id = _make_run("crm-read-customer-summary")
+    executor = WorkflowRunExecutor(run_id, agent_client=RecordingClient())
+    assert executor.agent_client is not None
+
+    # Drive a single node directly to prove the injected client is used.
+    executor.context = executor.context  # context already resolved by _make_run
+    from app.workflow.graph import WorkflowState
+
+    executor.scenario = get_scenario("crm-read-customer-summary")
+    state = WorkflowState(run_id=run_id, context={}, data={"tool_parameters": {"lead_id": "lead-1"}})
+    _asyncio.run(executor.n_invoke_agent(state))
+
+    assert calls == ["get_crm_lead"]
+    assert executor.agent_outcome is not None and executor.agent_outcome.call_id == "injected-call"
+
+
 # --------------------------------------------------------------------------
 # Environment readiness
 # --------------------------------------------------------------------------

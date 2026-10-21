@@ -44,7 +44,7 @@ from app.schemas.events import ExecutionEvent
 from app.schemas.evaluation import EvaluationSubmission
 from app.schemas.test_run import RunCreateRequest, RunDetail
 from app.schemas.workflow_report import CriterionScore, Finding, ReportEvidence, WorkflowReport
-from app.workflow.agent_client import AgentTurnOutcome, SyntheticToolAgentClient
+from app.workflow.agent_client import AgentTurnOutcome, SyntheticToolAgentClient, WorkflowAgentClient
 from app.workflow.evaluator import (
     CRITERION_WEIGHTS,
     DEFAULT_PASS_THRESHOLD,
@@ -163,8 +163,12 @@ def _failed_outcome(call_id: str, tool_name: str, code: str, message: str) -> Ag
 class WorkflowRunExecutor:
     """Builds and executes the workflow graph for one run."""
 
-    def __init__(self, run_id: str) -> None:
+    def __init__(self, run_id: str, agent_client: WorkflowAgentClient | None = None) -> None:
         self.run_id = run_id
+        # Injectable agent seam: defaults to the deterministic mock, but a
+        # live provider implementing the WorkflowAgentClient protocol can be
+        # passed in without changing this service (see agent_client.py).
+        self.agent_client: WorkflowAgentClient = agent_client or SyntheticToolAgentClient()
         self.context = RUN_CONTEXTS.get(run_id)
         self.scenario: ScenarioDefinition | None = None
         self.agent_outcome: AgentTurnOutcome | None = None
@@ -266,8 +270,7 @@ class WorkflowRunExecutor:
     async def n_invoke_agent(self, state: WorkflowState) -> None:
         assert self.scenario is not None and self.context is not None
         parameters = state.data.get("tool_parameters", {})
-        client = SyntheticToolAgentClient()
-        outcome = await client.run_turn(
+        outcome = await self.agent_client.run_turn(
             run_id=self.run_id,
             tool_name=self.scenario.tool_name,
             parameters=parameters,
@@ -584,23 +587,40 @@ class WorkflowRunExecutor:
         try:
             await asyncio.wait_for(graph.invoke(state), timeout=WORKFLOW_TOTAL_TIMEOUT_SECONDS)
         except TimeoutError:
-            update_test_run_state(
+            message = f"Workflow exceeded the {WORKFLOW_TOTAL_TIMEOUT_SECONDS:.0f}s total timeout."
+            # The graph was cut off before finalize, so publish the failed-run
+            # report here too (the report is still possible when the scenario
+            # was resolved before the timeout).
+            self._publish_failure_report({"code": "workflow_timeout", "message": message})
+            update_test_run_state(self.run_id, "failed", message, mark_completed=True)
+            _record_event(
                 self.run_id,
-                "failed",
-                f"Workflow exceeded the {WORKFLOW_TOTAL_TIMEOUT_SECONDS:.0f}s total timeout.",
-                mark_completed=True,
+                "error",
+                "Workflow timed out and was failed safely.",
+                {"code": "workflow_timeout", "report_id": self.report_id},
             )
-            _record_event(self.run_id, "error", "Workflow timed out and was failed safely.")
-            return {"run_id": self.run_id, "executed": True, "state": "failed", "report_id": None}
+            return {
+                "run_id": self.run_id,
+                "executed": True,
+                "state": "failed",
+                "report_id": self.report_id,
+            }
         except Exception as exc:  # noqa: BLE001 - background safety net; run must reach a terminal state
-            update_test_run_state(
+            message = f"Workflow crashed safely: {type(exc).__name__}."
+            self._publish_failure_report({"code": "workflow_crash", "message": message})
+            update_test_run_state(self.run_id, "failed", message, mark_completed=True)
+            _record_event(
                 self.run_id,
-                "failed",
-                f"Workflow crashed safely: {type(exc).__name__}.",
-                mark_completed=True,
+                "error",
+                "Workflow crashed and was failed safely.",
+                {"code": "workflow_crash", "report_id": self.report_id},
             )
-            _record_event(self.run_id, "error", "Workflow crashed and was failed safely.")
-            return {"run_id": self.run_id, "executed": True, "state": "failed", "report_id": None}
+            return {
+                "run_id": self.run_id,
+                "executed": True,
+                "state": "failed",
+                "report_id": self.report_id,
+            }
 
         final_run = get_test_run(self.run_id)
         return {

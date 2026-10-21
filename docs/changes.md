@@ -638,7 +638,7 @@ Result: backend **38 passed**; frontend **26 passed**; `tsc --noEmit` and `vite 
 ### C. Orchestration Service & Store Extensions — commit `0fe30da`
 - `backend/app/workflow/service.py`: `WorkflowRunExecutor` pipeline validate → verify_environment → build_scenario → invoke_agent → evaluate → publish_report → finalize; `RUN_CONTEXTS` registry and `build_run_context`; `execute_workflow_run` is idempotent via a queued-state guard; `WORKFLOW_TOTAL_TIMEOUT_SECONDS = 30`.
 - `backend/app/core/store.py` (**lead-owned file, additive-only** — flagged for team review): `WORKFLOW_REPORTS`, `update_test_run_state`, `save_workflow_report`, `get_workflow_report`, `get_workflow_report_for_run`.
-- Tests: `backend/tests/test_workflow_service.py` (20).
+- Tests: `backend/tests/test_workflow_service.py` (20 at this commit; 25 after later audit rounds).
 
 ### D. API Integration — commit `c4dd376`
 - `backend/app/api/routes/test_runs.py`: `POST /api/v1/test-runs` schedules background auto-execution **only** for registered scenario ids (response body still `state: "queued"` per the Phase 2 contract; unknown/missing scenarios keep legacy queued behavior asserted by `test_api_contracts.py`); new `POST /api/v1/test-runs/{run_id}/execute` (`404` unknown run, `409` non-queued or unregistered scenario with the registered id list).
@@ -667,7 +667,8 @@ Result: backend **38 passed**; frontend **26 passed**; `tsc --noEmit` and `vite 
 | Orchestration service + store helpers | `0fe30da` | 82 passed |
 | API integration | `c4dd376` | 94 passed |
 | E2E HTTP coverage | `b73e073` | 96 passed |
-| Professional audit fixes | *(final milestone commit)* | **109 passed** |
+| Professional audit fixes | `15111b8` | 109 passed |
+| Second independent audit round | *(final milestone commit)* | **112 passed** |
 
 All commits are local on `feature/workflow-evaluation-reporting` and have **not been pushed** (per instruction).
 
@@ -690,12 +691,41 @@ A professional self-audit was run against the Phase 3 guide's acceptance criteri
 ### Gap 3 — Security checks extracted into a standalone module
 - **Before**: secret-leak detection was embedded inside the `trace_integrity` scoring block in `evaluator.py`, so security logic and scoring logic were entangled.
 - **After**: new `backend/app/workflow/security_checks.py` owns `extract_secret_values`, `artifact_contains_secret`, and `evaluate_security`, returning a `SecurityCheckResult` with critical `secret_exposure` findings. `evaluate_run` calls it as a separate step and still applies its result to trace integrity, so behaviour is unchanged (a leaked secret zeroes trace integrity and blocks a pass) while the check is independently selectable and testable. `extract_secret_values` remains importable from `evaluator` for backward compatibility.
-- **Tests**: new `backend/tests/test_security_checks.py` (7 tests) exercises the module directly.
+- **Tests**: new `backend/tests/test_security_checks.py` (6 tests) exercises the module directly.
 
 ### Verification
-- Full suite: **109 passed** (was 96), ~1.3s, no network / Docker / credentials.
+- Full suite: **112 passed**, ~1.4s, no network / Docker / credentials.
 - Live uvicorn re-verification: pass run (`100.00`/`pass`), environment-failure run (`fail`, `0.0`, `environment_not_ready`), cleanup event observable before finalize, secret canary never present in the report response.
 - Secret scan of the whole diff: only intentional test canaries; no real credentials.
+
+---
+
+## I. Second Independent Audit Round
+
+Every one of the 11 Work-Package-D bullet requirements was re-verified against the actual source
+(not prior summaries). The five core requirements were confirmed fully implemented; four real
+defects were found and fixed.
+
+### Fix 1 — False "already pinned" dependency claim
+- **Before**: `docs/work-package-d-summary.md` and `docs/current-status.md` stated `langgraph` "is already pinned"; `backend/requirements.txt` contains no such dependency and the code never imports it.
+- **After**: docs now state the deliberate **zero-dependency** decision (the guide says use LangGraph *if appropriate*) and how to adopt the real library (`pin langgraph==0.2.28`, replace `graph.py` behind the same node/edge API).
+
+### Fix 2 — Injectable agent client (TargetAgent seam)
+- **Before**: `service.py` instantiated `SyntheticToolAgentClient` directly, so a live provider would require editing the service.
+- **After**: `WorkflowRunExecutor(run_id, agent_client=None)` accepts any object satisfying the `WorkflowAgentClient` protocol; the mock is only the default. The protocol docstring documents it as the integration seam for Naaneshwar's `TargetAgent`.
+- **Test**: `test_agent_client_is_injectable`.
+
+### Fix 3 — De-duplicated secret-key normalization
+- **Before**: `security_checks.py` re-implemented the redaction engine's key normalizer.
+- **After**: `app/core/redaction.py` exports a public `normalize_key`; `security_checks.py` imports it so the two definitions can never drift.
+
+### Fix 4 — Pre-finalize crash/timeout report boundary
+- **Before**: a global timeout or unexpected crash cut the graph off before `finalize`, so no report was ever published even when a scenario had been resolved.
+- **After**: the timeout/crash recovery path publishes a failed report (`workflow_timeout` / `workflow_crash`) **when a scenario exists**, and correctly stays report-less when the crash happens before scenario resolution (a validation-stage failure).
+- **Tests**: `test_workflow_level_crash_publishes_a_failed_report`, `test_crash_before_scenario_resolution_stays_report_less`.
+
+### Fix 5 — Accurate test counts
+- Documented totals corrected to the true figures: **112 total** (was mis-stated as 109), **74 WP-D**, `test_workflow_service.py` **25**, `test_security_checks.py` **6**.
 
 ### Documented coordination items (not code defects)
 1. `store.py` remains lead-owned — the additive workflow helpers still await team review.

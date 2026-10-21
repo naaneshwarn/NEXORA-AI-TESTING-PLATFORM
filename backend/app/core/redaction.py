@@ -39,8 +39,11 @@ SENSITIVE_KEYS: frozenset[str] = frozenset(
 
 
 def _normalize_key(key: str) -> str:
+    """Normalize a dictionary key for sensitive-name comparison (public helper)."""
     return re.sub(r"[^a-z0-9]", "", key.lower())
 
+
+normalize_key = _normalize_key  # public alias for reuse outside this module
 
 _NORMALIZED_SENSITIVE_KEYS = frozenset(_normalize_key(key) for key in SENSITIVE_KEYS)
 

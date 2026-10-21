@@ -46,7 +46,14 @@ class AgentTurnOutcome:
 
 
 class WorkflowAgentClient(Protocol):
-    """Minimal contract for anything that can execute an agent turn."""
+    """Minimal contract for anything that can execute an agent turn.
+
+    This is the documented integration seam for Naaneshwar's ``TargetAgent``
+    interface: any object with a compatible ``run_turn`` can be injected into
+    :class:`~app.workflow.service.WorkflowRunExecutor` via its ``agent_client``
+    argument, so swapping the mock for a live provider never touches the
+    workflow service.
+    """
 
     async def run_turn(
         self,

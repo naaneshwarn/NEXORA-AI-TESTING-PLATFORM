@@ -3,7 +3,7 @@
 **Owner:** Rahul (Workflows & Evaluation)
 **Branch:** `feature/workflow-evaluation-reporting`
 **Base:** `4703dbc` (*Merge pull request #7 — feature/synthetic-api*)
-**Status:** ✅ Complete, all fixes applied, **109 tests passing**
+**Status:** ✅ Complete, all fixes applied, **112 tests passing**
 **Last updated:** October 21, 2026
 
 > This document is the single consolidated record of *everything* done for Work Package D
@@ -140,7 +140,31 @@ found and **all were fixed** (final milestone commit):
   `evaluate_run` calls it as a separate step and still applies its result to trace integrity, so
   behaviour is unchanged while the check is independently selectable and testable.
   `extract_secret_values` stays importable from `evaluator` for backward compatibility.
-- **Evidence:** new `backend/tests/test_security_checks.py` (7 tests).
+- **Evidence:** new `backend/tests/test_security_checks.py` (6 tests).
+
+### Second audit round — independent re-verification of every requirement
+A second, independent audit re-read the source against all 11 bullet requirements in the guide
+(not against prior summaries). It confirmed the five core requirements were fully implemented and
+surfaced four real defects, all fixed:
+
+1. **False documentation claim.** Two docs stated "`langgraph` is already pinned" when
+   `backend/requirements.txt` contains no such dependency. Corrected to state the deliberate
+   zero-dependency decision and how to adopt the real library if the team prefers.
+2. **Non-injectable agent seam.** `service.py` instantiated `SyntheticToolAgentClient` directly,
+   contradicting the guide's "execute through Naaneshwar's `TargetAgent` interface". The client is
+   now an injectable `agent_client` constructor argument typed against the `WorkflowAgentClient`
+   protocol; the mock is only the default. `test_agent_client_is_injectable` proves a foreign
+   client is used without touching the service.
+3. **Duplicated secret-key normalization.** `security_checks.py` re-implemented the redaction
+   engine's key normalizer. It now imports `normalize_key` from `app.core.redaction` (exported as a
+   public helper) so the two can never drift.
+4. **Crash/timeout report boundary made explicit.** A workflow that is cut off before `finalize`
+   (global timeout or unexpected crash) now publishes a failed report **when a scenario was already
+   resolved**, and correctly stays report-less when the crash happens before scenario resolution.
+   Two tests pin both sides of this boundary (`test_workflow_level_crash_publishes_a_failed_report`,
+   `test_crash_before_scenario_resolution_stays_report_less`).
+5. **Test-count accuracy.** Documented counts were corrected to the true figures (112 total, 74
+   WP-D, service 25, security 6).
 
 ---
 
@@ -148,7 +172,7 @@ found and **all were fixed** (final milestone commit):
 
 ```
 python -m pytest -q
-109 passed, 5 warnings in ~1.3s
+112 passed, 5 warnings in ~1.4s
 ```
 
 | Module | Tests | Covers |
@@ -156,10 +180,10 @@ python -m pytest -q
 | pre-existing baseline (7 modules) | 38 | Phase 2/3 platform contracts (unchanged) |
 | `test_workflow_engine.py` | 13 | ordering, routing, cancellation, failure capture, cleanup-on-every-path, definition validation |
 | `test_workflow_evaluation.py` | 16 | scoring, thresholds, hallucination, secret leak, critical-finding rule |
-| `test_security_checks.py` | 7 | standalone security evaluator |
-| `test_workflow_service.py` | 23 | environment, idempotency, config errors, reports, timeouts, cancellation, cleanup |
+| `test_security_checks.py` | 6 | standalone security evaluator |
+| `test_workflow_service.py` | 25 | environment, idempotency, config errors, reports, timeouts, crash-recovery report boundary, cancellation, cleanup, injectable agent client |
 | `test_workflow_api.py` | 14 | execute/report endpoints, contract compatibility, secret canary, demo flow |
-| **Total** | **109** | **71 Work Package D tests added** |
+| **Total** | **112** | **74 Work Package D tests added** |
 
 Guarantees: **no API keys, no Docker, no network** required; fully deterministic (no clocks or
 randomness in assertions).
@@ -212,8 +236,13 @@ All commits are **local** on `feature/workflow-evaluation-reporting` and **have 
 
 ## 10. Suggested next steps (beyond WP-D scope)
 
-- Swap the in-repo state machine for real LangGraph (`langgraph` is already pinned) — the API was
-  deliberately kept compatible, so this is a drop-in change.
+- Swap the in-repo state machine for real LangGraph. The guide says "use LangGraph **if
+  appropriate**"; the deliberate decision here was an in-repo engine implementing the compatible
+  API subset with **zero new dependencies** (fully deterministic, no extra install surface for
+  the team's test environment). `langgraph 0.2.28` is available in the local environment but is
+  **not** a declared project dependency and is **not** imported. If the team prefers the real
+  library, pin it in `backend/requirements.txt` (e.g. `langgraph==0.2.28`) and replace
+  `graph.py` behind the same node/edge API — a drop-in change.
 - Wire a live LLM agent provider behind `agent_client.py`.
 - Extend the environment verification check to Rajath's Docker-backed provider once merged.
 - Add browser-level end-to-end coverage for the workflow report UI.

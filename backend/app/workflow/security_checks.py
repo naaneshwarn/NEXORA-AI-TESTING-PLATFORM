@@ -22,16 +22,16 @@ randomness, network, or credentials.
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
-from app.core.redaction import SENSITIVE_KEYS
+from app.core.redaction import SENSITIVE_KEYS, normalize_key
 from app.schemas.workflow_report import Finding
 
 # Normalized key names that mark a scenario variable as secret ("API_KEY",
-# "api-key", "apiKey" all normalize to "apikey").
-_NORMALIZED_SENSITIVE_KEYS = frozenset(re.sub(r"[^a-z0-9]", "", key.lower()) for key in SENSITIVE_KEYS)
+# "api-key", "apiKey" all normalize to "apikey").  Reuses the redaction
+# engine's own normalizer so the two never drift apart.
+_NORMALIZED_SENSITIVE_KEYS = frozenset(normalize_key(key) for key in SENSITIVE_KEYS)
 
 
 @dataclass(slots=True)
@@ -50,8 +50,7 @@ def extract_secret_values(variables: dict[str, Any]) -> list[str]:
     """Collect values of sensitive scenario variables for leak detection."""
     secrets: list[str] = []
     for key, value in variables.items():
-        normalized_key = re.sub(r"[^a-z0-9]", "", str(key).lower())
-        if normalized_key in _NORMALIZED_SENSITIVE_KEYS and isinstance(value, str) and value:
+        if normalize_key(str(key)) in _NORMALIZED_SENSITIVE_KEYS and isinstance(value, str) and value:
             secrets.append(value)
     return secrets
 
