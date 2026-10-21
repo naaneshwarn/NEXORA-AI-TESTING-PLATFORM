@@ -30,6 +30,7 @@ and :func:`redact_connection` produces the safe view used by routes and logs.
 from __future__ import annotations
 
 import secrets
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
@@ -350,15 +351,29 @@ class EnvironmentManager:
     # -- internals ---------------------------------------------------------
 
     def _seed(self, container_id: str, spec: ContainerSpec) -> None:
+        """Seed the synthetic schema/data, retrying transient startup races.
+
+        Even after readiness passes, the PostgreSQL entrypoint may restart the
+        server once during initialization.  A short bounded retry makes seeding
+        robust against that without masking genuine SQL errors (``ON_ERROR_STOP``
+        means a real SQL error still fails after the retries are exhausted).
+        """
         sql = database_seed.render_full_seed_sql(self.seed_schema)
-        code, _out, err = self.provider.exec_command(
-            container_id,
-            ["psql", "-v", "ON_ERROR_STOP=1", "-U", spec.username, "-d", spec.database, "-f", "-"],
-            input_text=sql,
-        )
-        if code != 0:
+        attempts = 3
+        last_detail = ""
+        for attempt in range(1, attempts + 1):
+            code, _out, err = self.provider.exec_command(
+                container_id,
+                ["psql", "-v", "ON_ERROR_STOP=1", "-U", spec.username, "-d", spec.database, "-f", "-"],
+                input_text=sql,
+            )
+            if code == 0:
+                return
             detail = (err or "").strip().splitlines()[-1] if (err or "").strip() else "no stderr"
-            raise ProvisionError(f"Seeding failed (psql exit {code}: {detail}).")
+            last_detail = f"psql exit {code}: {detail}"
+            if attempt < attempts:
+                time.sleep(0.5)
+        raise ProvisionError(f"Seeding failed ({last_detail}).")
 
     def _run_sql(
         self,

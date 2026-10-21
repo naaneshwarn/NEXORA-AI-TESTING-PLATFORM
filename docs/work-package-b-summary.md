@@ -54,7 +54,16 @@ Thin HTTP layer over the manager; **no business logic in routes**.
 | File | What it covers |
 | --- | --- |
 | `backend/tests/test_environment_service.py` | 26 Docker-free tests of the real manager against a fake provider: happy path, Docker-unavailable failure, container-not-running failure, seed failure, create failure, unsupported engine, reset, stop, cleanup after success and partial failure, repeated cleanup idempotency, credential redaction, and route-level contract/404/lifecycle. |
-| `backend/tests/test_environment_docker_integration.py` | Optional live-Docker integration tests. **Skip cleanly** when Docker is unavailable (`pytest.mark.docker`), so the default run stays green everywhere. |
+| `backend/tests/test_docker_provider_sdk.py` | 20 Docker-free tests of the **real `DockerProvider`** against a faithful fake **Docker SDK client** (the seam the provider actually calls): config → SDK kwargs, ownership labels, loopback binding, SDK-error normalization, exec with/without stdin (proving stdin uses the low-level API, since `exec_run` rejects `input=`), inspection, readiness (real query, not just `pg_isready`), stop, and idempotent remove. |
+| `backend/tests/test_environment_docker_integration.py` | Optional live-Docker integration tests. **Skip cleanly** when Docker is unavailable (`pytest.mark.docker`), so the default run stays green everywhere. Use per-run unique ids and a `finally` safety-net removal so repeated runs never collide or leak. |
+| `backend/tests/conftest.py` | Autouse fixture that pins the API's environment manager to a Docker-free provider, so ordinary tests are hermetic and **cannot create real containers or leak them**. |
+| `backend/tests/_wp_b_acceptance_probe.py` | Manual real-Docker harness: 13 checks covering all five acceptance points end-to-end. |
+| `backend/tests/_wp_b_partial_failure_probe.py` | Manual real-Docker harness: partial-failure cleanup with leak detection. |
+| `backend/tests/_wp_b_log_leak_probe.py` | Manual real-Docker harness: canary password must not appear in logs/serialization. |
+
+> Files beginning with `_` are not collected by pytest; run them explicitly, e.g.
+> `python backend/tests/_wp_b_acceptance_probe.py` with `PYTHONPATH=backend`.
+
 
 ---
 
@@ -66,11 +75,20 @@ Thin HTTP layer over the manager; **no business logic in routes**.
    `BackgroundTasks`; the response is contract-identical while the container is
    created out of band and the record later becomes `ready` or `failed`.
 
-2. **Seeding via `exec_run(psql …)` instead of a host DB driver.**
+2. **Seeding via `psql` inside the container instead of a host DB driver.**
    The backend declares no PostgreSQL client dependency (`psycopg`/`psycopg2`
    are absent), and the guide forbids exposing database ports broadly. Seeding
    from *inside* the container with `psql` needs no host driver and keeps the
    exposure minimal.
+
+   The SQL is piped on **stdin** (`psql … -f -`). The high-level
+   `Container.exec_run` does **not** accept an `input=` argument — a fact the
+   real Docker run exposed (the mocked provider had hidden it). We therefore use
+   the low-level exec API (`api.exec_create(..., stdin=True)` +
+   `api.exec_start(socket=True)`) and write to the raw socket, handling both the
+   POSIX wrapper (`_sock`) and the Windows `NpipeSocket`. Seeding retries up to
+   3× with a short backoff, because the PostgreSQL entrypoint can restart the
+   server once during initialization.
 
 3. **Loopback-only ports by default.**
    The default host binding is `127.0.0.1` on an ephemeral port. A caller must
@@ -85,7 +103,11 @@ Thin HTTP layer over the manager; **no business logic in routes**.
 5. **Verify, never assume.**
    `DockerProvider.is_running` inspects the container; `stop` reloads and checks
    the reported status before reporting success. `provision` refuses to mark an
-   environment `ready` unless the container is running *and* `pg_isready` passes.
+   environment `ready` unless the container is running *and* a **real query**
+   (`psql -c "SELECT 1"`) against the target database succeeds. `pg_isready`
+   alone is not sufficient: real Docker runs showed it can report “accepting
+   connections” while PostgreSQL is still starting up, which produced
+   intermittent `FATAL: the database system is starting up` seeding failures.
 
 6. **No secret leakage.**
    Credentials live only under `metadata["connection"]`. The route layer applies
@@ -146,10 +168,15 @@ From the repository root:
 python -m pytest backend -q
 ```
 
-Expected result on a machine without Docker (verified): **65 passed, 3 skipped**.
-The 3 skips are the live-Docker integration tests.
+Expected result on a machine without Docker (verified): **85 passed, 3 skipped**.
+The 3 skips are the live-Docker integration tests; they announce the reason
+clearly.
 
-With Docker running, to exercise the real provider:
+With Docker running, every test executes, including the live ones:
+**88 passed, 0 skipped** (verified 5× consecutively with real Docker, 0 leaked
+containers each run).
+
+To exercise the real provider explicitly:
 
 ```bash
 pip install -r backend/requirements.txt   # includes docker==7.1.0
@@ -157,6 +184,18 @@ python -m pytest backend/tests/test_environment_docker_integration.py -v
 ```
 
 `docker version` must succeed first. The first run pulls `postgres:16-alpine`.
+
+### Real-Docker verification harnesses
+
+Three manual harnesses prove the acceptance points against a genuine daemon.
+They are prefixed with `_` so pytest does **not** collect them; run them
+directly with `PYTHONPATH=backend`:
+
+```bash
+python backend/tests/_wp_b_acceptance_probe.py        # 13/13 acceptance checks
+python backend/tests/_wp_b_partial_failure_probe.py   # 4/4 partial-failure cleanup
+python backend/tests/_wp_b_log_leak_probe.py          # 3/3 no-credential-in-logs
+```
 
 ---
 
@@ -182,5 +221,39 @@ python -m pytest backend/tests/test_environment_docker_integration.py -v
 - **Live integration tests are opt-in.** They require Docker and network access
   to pull the image, so they skip by default. This is intentional and matches the
   guide's testing rule.
-- **No container health `HEALTHCHECK` reliance.** Readiness is verified with
-  `pg_isready` polling inside the container, not by trusting Docker health alone.
+- **No container health `HEALTHCHECK` reliance.** Readiness is verified with a
+  real `SELECT 1` query executed inside the container (after a cheap
+  `pg_isready` gate), not by trusting Docker health alone.
+
+---
+
+## 9. Real-Docker verification (why it matters)
+
+The unit suite mocks Docker, as the guide requires, but mocks can only verify the
+contract we *believe* the SDK has. Running the same code against a **real**
+daemon caught two genuine defects that the mocks could not:
+
+1. **stdin seeding silently failed.** `Container.exec_run` has no `input=`
+   parameter, so `psql -f -` received no SQL. The provider-level fake accepted an
+   `input_text` kwarg and “passed”, hiding the bug. Fixed by using the low-level
+   exec API for stdin (see §3.2), and by adding
+   `test_docker_provider_sdk.py`, which fakes the **SDK client** (the seam the
+   provider really calls) so this class of bug is caught without Docker.
+
+2. **Intermittent readiness race.** `pg_isready` reported success while
+   PostgreSQL was still starting up, so seeding failed with exit 2
+   (`FATAL: the database system is starting up`). Fixed by requiring a real
+   `SELECT 1` for readiness plus a bounded seeding retry (see §3.5).
+
+A **container-leak** was also found: the Phase 2 contract test drives the real
+app via `TestClient`, and with Docker running its `/stop`-only flow left a
+stopped container behind. Fixed with a `backend/tests/conftest.py` autouse
+fixture that pins the API's environment manager to a Docker-free provider, so
+ordinary tests can never create or leak real containers.
+
+**Verified results (5 consecutive full-suite runs with real Docker):**
+`88 passed, 0 skipped, 0 leaked containers` each time. The acceptance probes
+passed `13/13`, `4/4`, and `3/3`. A full HTTP end-to-end run produced a real
+`postgres:16-alpine` container bound to `127.0.0.1` (not `0.0.0.0`), with the
+deterministic 3-row seed queryable, reset restoring the seed after mutation,
+`destroy` removing the container, and `[REDACTED]` credentials throughout.

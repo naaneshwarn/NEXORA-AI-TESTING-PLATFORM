@@ -63,6 +63,13 @@ skip_reason = (
 )
 
 
+def _unique_id(prefix: str) -> str:
+    """Return a per-run unique environment id so repeated runs never collide."""
+    import uuid
+
+    return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
 @pytest.mark.skipif(not _DOCKER_READY, reason=skip_reason)
 def test_provision_seed_and_destroy_real_postgres() -> None:
     """Full happy path against a real PostgreSQL container."""
@@ -77,23 +84,25 @@ def test_provision_seed_and_destroy_real_postgres() -> None:
         label="integration-postgres",
         config={"database": "nexora_it", "image": "postgres:16-alpine"},
     )
-
+    env = None
+    container_id: str | None = None
     try:
-        result = manager.provision(request, environment_id="env-it-live")
+        result = manager.provision(request, environment_id=_unique_id("env-it-live"))
         env = result.environment
+        container_id = env.metadata.get("container_id")
 
         # Provisioning must have genuinely succeeded against the real daemon.
         assert result.ok is True, env.metadata.get("error")
         assert env.status == "ready"
         assert env.metadata["lifecycle"] == "ready"
-        assert env.metadata["container_id"]
+        assert container_id
 
         # The container must actually be running — inspected, not assumed.
-        assert provider.is_running(env.metadata["container_id"]) is True
+        assert provider.is_running(container_id) is True
 
         # Verify the synthetic seed is queryable from inside the container.
         code, out, err = provider.exec_command(
-            env.metadata["container_id"],
+            container_id,
             [
                 "psql",
                 "-U",
@@ -114,9 +123,12 @@ def test_provision_seed_and_destroy_real_postgres() -> None:
         # Teardown: cleanup removes only the container we created.
         destroyed = manager.cleanup_environment(reset)
         assert destroyed.metadata["cleanup"] == "removed"
-        assert provider.is_running(destroyed.metadata["container_id"]) is False
+        assert provider.is_running(container_id) is False
+        container_id = None  # already removed
     finally:
         # Safety net: never leave an owned container behind on failure.
+        if container_id is not None:
+            provider.remove(container_id, force=True)
         provider.close()
 
 
@@ -130,13 +142,17 @@ def test_repeated_cleanup_is_safe_against_real_docker() -> None:
         label="integration-cleanup",
         config={"database": "nexora_it2"},
     )
-
+    container_id: str | None = None
     try:
-        env = manager.provision(request, environment_id="env-it-cleanup").environment
+        env = manager.provision(request, environment_id=_unique_id("env-it-cleanup")).environment
+        container_id = env.metadata.get("container_id")
         first = manager.cleanup_environment(env)
         second = manager.cleanup_environment(first)
         assert second.metadata["lifecycle"] == "destroyed"
+        container_id = None
     finally:
+        if container_id is not None:
+            provider.remove(container_id, force=True)
         provider.close()
 
 
@@ -145,7 +161,7 @@ def test_default_binding_is_loopback_only() -> None:
     """The container's DB port must be bound to loopback, not 0.0.0.0."""
     provider = DockerProvider()
     spec = ContainerSpec(environment_id="env-it-bind", expose_publicly=False)
-    ports = DockerProvider._ports(spec)  # static helper, no daemon needed
+    ports = provider._ports(spec)  # instance helper, no daemon needed
     host_ip, host_port = ports[f"{spec.internal_port}/tcp"]
     assert host_ip == "127.0.0.1"
     assert host_port is None  # ephemeral

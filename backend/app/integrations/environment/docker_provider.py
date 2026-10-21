@@ -115,6 +115,9 @@ class DockerClientProtocol(Protocol):
     @property
     def networks(self) -> Any: ...
 
+    @property
+    def api(self) -> Any: ...
+
     def close(self) -> None: ...
 
 
@@ -266,16 +269,66 @@ class DockerProvider:
         """Run a command inside the container; return ``(exit_code, stdout, stderr)``.
 
         Used to seed via ``psql`` so no host-side DB driver is required.
+
+        When ``input_text`` is supplied the command's stdin is fed that text.  The
+        high-level ``Container.exec_run`` API does **not** accept stdin, so we use
+        the low-level exec API (``exec_create`` + ``exec_start(socket=True)``) and
+        write to the raw socket.  This works over both the Windows npipe transport
+        (``NpipeSocket``) and the POSIX transport (wrapped socket with ``_sock``).
         """
         try:
             container = self._get_client().containers.get(container_id)
-            result = container.exec_run(command, demux=True, stdin=bool(input_text), input=input_text)
-            exit_code = int(getattr(result, "exit_code", 1) or 0)
-            output = getattr(result, "output", (b"", b""))
-            stdout, stderr = _decode_exec_output(output)
-            return exit_code, stdout, stderr
         except Exception as exc:  # noqa: BLE001
             raise ProvisionError(f"exec failed in container: {type(exc).__name__}") from exc
+
+        if input_text is None:
+            try:
+                result = container.exec_run(command, demux=True)
+            except Exception as exc:  # noqa: BLE001
+                raise ProvisionError(f"exec failed in container: {type(exc).__name__}") from exc
+            exit_code = int(getattr(result, "exit_code", 1) or 0)
+            stdout, stderr = _decode_exec_output(getattr(result, "output", (b"", b"")))
+            return exit_code, stdout, stderr
+
+        return self._exec_with_stdin(container_id, command, input_text)
+
+    def _exec_with_stdin(self, container_id: str, command: list[str], input_text: str) -> tuple[int, str, str]:
+        """Run a command feeding ``input_text`` on stdin via the low-level exec API."""
+        api = self._get_client().api
+        try:
+            exec_id = api.exec_create(container_id, command, stdin=True, stdout=True, stderr=True)["Id"]
+            sock = api.exec_start(exec_id, socket=True, demux=False)
+            raw = getattr(sock, "_sock", sock)  # POSIX wrapper vs. NpipeSocket
+            raw.sendall(input_text.encode("utf-8"))
+            try:
+                raw.shutdown(1)  # signal EOF on stdin
+            except Exception:  # noqa: BLE001 - not all sockets support half-close
+                pass
+            chunks: list[bytes] = []
+            try:
+                while True:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            except Exception:  # noqa: BLE001 - read until close
+                pass
+            output = b"".join(chunks).decode("utf-8", errors="replace")
+            # The exit code can lag slightly; poll briefly until it is recorded.
+            exit_code: int | None = None
+            for _ in range(20):
+                exit_code = api.exec_inspect(exec_id).get("ExitCode")
+                if exit_code is not None:
+                    break
+                time.sleep(0.1)
+            if exit_code is None:
+                # Unknown exit code: treat as failure rather than silently succeeding.
+                return 1, output, output
+            return int(exit_code), output, ""
+        except ProvisionError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise ProvisionError(f"exec (stdin) failed in container: {type(exc).__name__}") from exc
 
     def wait_for_ready(
         self,
@@ -286,18 +339,25 @@ class DockerProvider:
         timeout_seconds: float = 30.0,
         poll_interval: float = 0.5,
     ) -> bool:
-        """Poll ``pg_isready`` until the database accepts connections.
+        """Poll until the database *genuinely* accepts queries.
 
-        Returns True on success.  ``time.sleep`` is called only in the real
-        polling loop; unit tests pass a fake provider and never reach it.
+        ``pg_isready`` alone is not sufficient: it can report "accepting
+        connections" while PostgreSQL is still in its startup/recovery phase, so a
+        real query then fails with ``FATAL: the database system is starting up``.
+        (This was observed as an intermittent seeding failure against real Docker.)
+
+        We therefore require a real ``SELECT 1`` against the target database to
+        succeed before reporting ready.  ``time.sleep`` is called only in the
+        real polling loop; unit tests pass a fake provider and never reach it.
         """
         deadline = time.monotonic() + max(timeout_seconds, 0.0)
         while True:
             if not self.is_running(container_id):
                 return False
+            # A real connection to the target database is the readiness signal.
             code, _out, _err = self.exec_command(
                 container_id,
-                ["pg_isready", "-U", username, "-d", database],
+                ["psql", "-v", "ON_ERROR_STOP=1", "-U", username, "-d", database, "-tAc", "SELECT 1;"],
             )
             if code == 0:
                 return True

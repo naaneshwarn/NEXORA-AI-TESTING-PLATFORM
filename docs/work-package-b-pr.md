@@ -23,8 +23,10 @@ the existing routes:
   maps lifecycle onto the existing shared schema, redacts credentials, and cleans up
   partial failures.
 - **`DockerProvider`** talks to the Docker Engine via the Python SDK: create, start,
-  inspect (verify running before claiming ready), `pg_isready` polling, in-container
-  `psql` seeding, genuine `stop` with verification, and ownership-filtered removal.
+  inspect (verify running before claiming ready), **real-query readiness** (a
+  `SELECT 1`, not just `pg_isready`), in-container `psql` seeding over **stdin via
+  the low-level exec API** (the high-level `exec_run` has no `input=`), genuine
+  `stop` with verification, and ownership-filtered removal.
 - **`database_seed.py`** produces a deterministic synthetic PostgreSQL schema and
   dataset (no real records).
 - Routes stay thin; no business logic. The Phase 2 contract is preserved exactly.
@@ -49,8 +51,10 @@ Safety properties (per the Phase 3 guide):
 | `backend/app/integrations/environment/__init__.py` | Rajath | **new** — public surface |
 | `backend/app/integrations/__init__.py` | Rajath | **new** — package marker |
 | `backend/app/api/routes/environments.py` | Rajath | rewired to the service; contract preserved; additive reset/destroy |
-| `backend/tests/test_environment_service.py` | Rajath | **new** — 25 Docker-free tests |
+| `backend/tests/test_environment_service.py` | Rajath | **new** — 26 Docker-free tests |
+| `backend/tests/test_docker_provider_sdk.py` | Rajath | **new** — 20 tests faking the Docker SDK client (exercises the real provider) |
 | `backend/tests/test_environment_docker_integration.py` | Rajath | **new** — skip-safe live-Docker tests |
+| `backend/tests/conftest.py` | Rajath | **new** — autouse Docker-free manager (prevents real containers in tests) |
 | `backend/requirements.txt` | Rajath | additive `docker==7.1.0` (lazily imported) |
 | `pytest.ini` | Rajath | registers `docker` marker (skip-safe integration tests) |
 | `docs/work-package-b-summary.md` | Rajath | **new** — full design record |
@@ -63,17 +67,24 @@ No shared schema (`app/schemas/`) or lead-owned store (`app/core/store.py`) was 
 python -m pytest backend -q
 ```
 
-**Actual result (verified on this machine, Docker daemon NOT running):**
+**Actual result with Docker running (verified 5× consecutively, 0 leaked containers):**
 
 ```
-65 passed, 3 skipped
+88 passed
+```
+
+With Docker unavailable (e.g. `DOCKER_HOST` pointed at a bogus pipe), the live
+tests skip cleanly:
+
+```
+85 passed, 3 skipped
 ```
 
 - 38 = pre-existing Phase 2 baseline (unchanged, still passing).
 - 26 = new Docker-free environment-service tests.
-- 1 = new pure unit check (DSN shape).
-- 3 skipped = live Docker integration tests (`pytest.mark.docker`), skipped
-  cleanly because Docker Desktop was not running.
+- 20 = new Docker-SDK-client tests (real provider, fake SDK client).
+- 4 = live-Docker integration tests (1 pure-DSN check runs even without Docker).
+- 3 skipped = the 3 remaining live Docker integration tests when Docker is down.
 
 With Docker running:
 
