@@ -1,30 +1,34 @@
-"""Shared pytest fixtures (Rajath — Work Package B).
+"""Shared pytest fixtures for the backend suite (Work Packages B and D).
 
-Purpose
--------
-Guarantee that the *test suite never talks to a real Docker daemon by accident*.
+This file is the single merge point of the two independent work packages:
 
-The Phase 2 contract test ``test_api_contracts.py::test_environment_and_evaluation_contract``
-drives the real FastAPI app via ``TestClient(app)``.  With Work Package B in
-place, ``POST /api/v1/environments`` schedules real provisioning in the
-background.  On a machine where Docker is running, that path would create a real
-container — an unwanted side effect that can also leak a container when the test
-only calls ``/stop`` (stop != remove).
+* **Work Package B (Rajath / environments)** — guarantees the test suite never
+  talks to a real Docker daemon by accident.  The Phase 2 contract test drives
+  the real FastAPI app via ``TestClient(app)``; with WP-B in place,
+  ``POST /api/v1/environments`` schedules real provisioning in the background.
+  On a machine where Docker runs, that would create (and potentially leak) a
+  real container.  ``_docker_free_environment_manager`` installs a
+  deterministic, Docker-free provider for the process-wide environment manager
+  so unit/contract tests stay hermetic.  The only tests that touch the real
+  daemon are the explicitly marked live integration tests in
+  ``test_environment_docker_integration.py``, which opt in via their own
+  provider instance.
 
-This conftest installs a deterministic, Docker-free provider for the process-wide
-environment manager for the duration of the test session, so:
+* **Work Package D (Rahul / workflow)** — isolates the workflow subsystem's
+  durable run-context store into a temporary directory so tests never write
+  into the repository and always start from a clean snapshot, and silences
+  workflow logging noise during the run.
 
-- unit/contract tests are hermetic and need no Docker (guide rule);
-- no real container is created by ordinary tests;
-- the only tests that touch the real daemon are the explicitly marked live
-  integration tests in ``test_environment_docker_integration.py``, which opt in
-  via their own provider instance.
-
-Nothing here changes production behaviour: it only replaces the manager used by
-the in-process API during tests.
+Nothing here changes production behaviour: it only adjusts the manager used by
+the in-process API and the workflow store's target directory during tests.
 """
 
 from __future__ import annotations
+
+import logging
+import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -33,7 +37,15 @@ from app.integrations.environment.docker_provider import (
     DEFAULT_INTERNAL_PORT,
 )
 
+# Make ``app`` importable when pytest is invoked from the repository root.
+_BACKEND = Path(__file__).resolve().parents[1]
+if str(_BACKEND) not in sys.path:
+    sys.path.insert(0, str(_BACKEND))
 
+
+# --------------------------------------------------------------------------- #
+# Work Package B — Docker-free environment manager                             #
+# --------------------------------------------------------------------------- #
 class _NoopDockerProvider:
     """A provider that provisions nothing and never touches Docker.
 
@@ -91,3 +103,24 @@ def _docker_free_environment_manager():
         yield
     finally:
         env_routes.set_manager(None)
+
+
+# --------------------------------------------------------------------------- #
+# Work Package D — isolated, quiet workflow state                              #
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_workflow_state():
+    """Redirect the durable run-context store to a throwaway temp directory."""
+    import app.workflow.service as service
+    import app.workflow.runtime as runtime
+
+    tmp = Path(tempfile.mkdtemp(prefix="nexora-wf-test-"))
+    # Point the store at an isolated path and reset cached singletons.
+    service._CONTEXT_STORE = runtime.RunContextStore(tmp / "run_contexts.json")
+    service.RUN_CONTEXTS.clear()
+    # Reduce log noise for the test run.
+    logging.getLogger("nexora").setLevel(logging.CRITICAL)
+
+    yield
+
+    logging.getLogger("nexora").setLevel(logging.NOTSET)

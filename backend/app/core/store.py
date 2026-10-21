@@ -15,6 +15,7 @@ ENVIRONMENTS: dict[str, SyntheticEnvironment] = {}
 EVENTS: dict[str, list[ExecutionEvent]] = {}
 REPORTS: dict[str, ReportSummary] = {}
 TOOL_TRACES: dict[str, list[dict]] = {}
+WORKFLOW_REPORTS: dict[str, dict] = {}
 
 
 def utc_now() -> datetime:
@@ -143,6 +144,49 @@ def get_report(report_id: str) -> ReportSummary | None:
     return REPORTS.get(report_id)
 
 
+def update_test_run_state(
+    run_id: str,
+    state: str,
+    message: str | None = None,
+    mark_started: bool = False,
+    mark_completed: bool = False,
+) -> RunDetail | None:
+    """Transition a run to a new lifecycle state.
+
+    Returns ``None`` for unknown runs.  ``mark_started``/``mark_completed``
+    stamp the corresponding timestamps so reports can show real durations.
+    """
+    run = TEST_RUNS.get(run_id)
+    if run is None:
+        return None
+    run.state = state
+    if message is not None:
+        run.message = message
+    if mark_started:
+        run.started_at = utc_now()
+    if mark_completed:
+        run.completed_at = utc_now()
+    return run
+
+
+def save_workflow_report(report: dict) -> dict:
+    """Persist a rich workflow evaluation report keyed by its report ID."""
+    WORKFLOW_REPORTS[report["report_id"]] = report
+    return report
+
+
+def get_workflow_report(report_id: str) -> dict | None:
+    return WORKFLOW_REPORTS.get(report_id)
+
+
+def get_workflow_report_for_run(run_id: str) -> dict | None:
+    """Return the most recent workflow report generated for a run, if any."""
+    for report in reversed(list(WORKFLOW_REPORTS.values())):
+        if report.get("run_id") == run_id:
+            return report
+    return None
+
+
 # CRM Leads state
 CRM_LEADS: dict[str, dict] = {}
 
@@ -194,6 +238,10 @@ class Store:
     get_traces_for_run = get_traces_for_run
     submit_evaluation = submit_evaluation
     get_report = get_report
+    update_test_run_state = update_test_run_state
+    save_workflow_report = save_workflow_report
+    get_workflow_report = get_workflow_report
+    get_workflow_report_for_run = get_workflow_report_for_run
     create_crm_lead = create_crm_lead
     get_crm_lead = get_crm_lead
     list_crm_leads = list_crm_leads

@@ -194,6 +194,103 @@ class ReportSummary(BaseModel):
     generated_at: datetime | None = None
 ```
 
+## Phase 3 workflow contracts (Work Package D — Rahul)
+
+These endpoints are additive. The Phase 2 contracts above are unchanged: `POST /api/v1/test-runs` still returns `201` with `state: "queued"`, and `GET /api/v1/reports/{report_id}` still serves `ReportSummary`.
+
+### 6. Execute a queued workflow run on demand
+
+| Method | Path | Request schema | Response schema | Status codes | Responsible module |
+| --- | --- | --- | --- | --- | --- |
+| POST | `/api/v1/test-runs/{run_id}/execute` | none | `ApiEnvelope[RunDetail]` | 200, 404, 409 | Rahul |
+
+Behavior:
+
+- Runs the registered scenario through the deterministic workflow engine and returns the terminal `RunDetail` (`passed` / `failed` / `cancelled`).
+- `404` — the run does not exist.
+- `409` — the run is not in the `queued` state (including runs that already auto-executed), or its scenario name is not registered in `app/workflow/scenarios.py`. The `409` body lists the registered scenario ids so callers can self-correct.
+- Auto-execution note: `POST /api/v1/test-runs` schedules this same execution as a FastAPI `BackgroundTasks` job **only** when `scenario.name` matches a registered scenario id. Unknown or missing scenarios keep the legacy `queued` behavior asserted by the Phase 2 contract tests.
+
+### 7. Retrieve the rich workflow report for a run
+
+| Method | Path | Request schema | Response schema | Status codes | Responsible module |
+| --- | --- | --- | --- | --- | --- |
+| GET | `/api/v1/test-runs/{run_id}/report` | none | `ApiEnvelope[WorkflowReport]` | 200, 404 | Rahul |
+
+`WorkflowReport` fields (schema: `backend/app/schemas/workflow_report.py`):
+
+```python
+class CriterionScore(BaseModel):
+    criterion: Literal["task_completion", "factual_correctness", "trace_integrity"]
+    weight: float          # 40 / 40 / 20
+    score: float           # 0-100
+    rationale: str
+
+class Finding(BaseModel):
+    severity: Literal["info", "warning", "critical"]
+    code: str              # e.g. unsupported_fact, secret_leak, tool_error
+    message: str
+    evidence_ref: str | None = None   # tool-call id, never raw secret material
+
+class ReportEvidence(BaseModel):
+    scenario_id: str
+    agent_ids: list[str]
+    tool_call_ids: list[str]
+    event_ids: list[str]
+
+class WorkflowReport(BaseModel):
+    report_id: str
+    run_id: str
+    scenario_id: str
+    status: Literal["pass", "fail"]
+    score: float                       # weighted total, 0-100
+    pass_threshold: float              # per-run config, default 70.0
+    summary: str
+    criteria: list[CriterionScore]
+    findings: list[Finding]
+    evidence: ReportEvidence
+    workflow_state: str                # terminal graph state
+    duration_ms: float
+    generated_at: datetime | None = None
+```
+
+Evaluation rules (implemented in `backend/app/workflow/evaluator.py`):
+
+- Weighted score = `task_completion * 0.40 + factual_correctness * 0.40 + trace_integrity * 0.20`.
+- `pass` requires `score >= pass_threshold` **and** zero `critical` findings — a critical finding (e.g. a secret leak or an unsupported fact) always forces `fail`, regardless of score.
+- Environment failures (`environment_not_found`, `environment_not_ready`) occur **after** validation, so they publish a useful failed-run report: `status: "fail"`, `score: 0.0`, zero-scored criteria, and a `critical` finding carrying the error code. `GET .../report` returns `200`.
+- Invalid `config.pass_threshold` (non-numeric or outside 0–100) fails the run before evaluation with a clear `pass_threshold` message and publishes no report (`GET .../report` → `404`); the same applies to other validation-stage errors (unknown scenario, missing run context).
+- All secrets supplied through `scenario.variables` are redacted before storage; reports, traces, and events never contain raw secret values. Secret-leak detection lives in the standalone `backend/app/workflow/security_checks.py` module and emits a critical `secret_exposure` finding when a value reaches persisted artifacts.
+
+Compatibility with the Phase 2 report surface: publishing a workflow run also writes a `ReportSummary` projection into the existing `REPORTS` store, so `GET /api/v1/reports/{report_id}` keeps working for workflow runs (`score`, `run_id`, `summary` are mirrored; the rich detail lives only behind `/test-runs/{run_id}/report`).
+
+### 8. Workflow subsystem readiness and metrics
+
+| Method | Path | Auth | Response | Statuses | Owner |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| GET | `/api/v1/workflow/readiness` | none | `ApiEnvelope[object]` | 200 | Rahul |
+
+Additive, workflow-owned observability endpoint. The shared Phase 2 `GET /api/v1/health` contract is unchanged.
+
+Response `data`:
+
+```jsonc
+{
+  "ready": true,                        // durable run-context store reachable
+  "state_store_path": "...run_contexts.json",
+  "pending_run_contexts": 0,            // queued/running contexts held durably
+  "metrics": {
+    "started": 0, "finished": 0, "passed": 0, "failed": 0,
+    "cancelled": 0, "rejected": 0, "recovered": 0
+  }
+}
+```
+
+- `ready` is `true` when the durable store loaded successfully; the endpoint never raises (a store failure reports `ready: false`).
+- Metrics are process-lifetime counters: `rejected` counts executions refused because the run was not queued/found; `recovered` counts runs terminalized by startup recovery.
+- Operational configuration is settings-driven and env-overridable: `WORKFLOW_TOTAL_TIMEOUT_SECONDS`, `WORKFLOW_AGENT_TIMEOUT_SECONDS`, `WORKFLOW_DEFAULT_PASS_THRESHOLD`, `WORKFLOW_MAX_CONCURRENT_RUNS`, `WORKFLOW_STATE_DIR`.
+- On startup the service recovers runs left `queued`/`running` by a previous process (marked `failed`) and logs the workflow subsystem as ready.
+
 ## Shared contract decisions pending team approval
 
 - Whether run lifecycle should expose a richer state machine beyond queued/running/passed/failed/cancelled.
