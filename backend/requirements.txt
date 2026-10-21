@@ -6,3 +6,8 @@ pytest==8.3.4
 httpx==0.28.1
 starlette==0.41.3
 sse-starlette==2.1.3
+# --- additive dependency: Work Package B (Rajath) ---
+# Docker SDK for real synthetic-environment provisioning. Imported lazily by
+# app/integrations/environment/docker_provider.py, so unit tests and the API run
+# fine without it; it is only required for live container provisioning.
+docker==7.1.0
