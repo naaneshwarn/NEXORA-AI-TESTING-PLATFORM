@@ -1,75 +1,100 @@
-# NEXORA architecture foundation
+# NEXORA Architecture & Integration Guide
 
-## Overview
+## Platform Overview
 
-NEXORA starts as a modular monolith with clear boundaries for a future multi-service platform. The initial MVP keeps the application small enough to run locally with default configuration while reserving the interfaces required for workflow orchestration, simulation infrastructure, and evaluation logic.
+NEXORA is designed as a modular monolith with clear domain boundaries, providing an AI testing and benchmarking foundation. The architecture isolates API ingress, workflow orchestration, synthetic database provisioning, and evaluation reporting into distinct components that can evolve into distributed microservices in later phases.
 
-## Current structure
+---
 
-- `apps/web/` – existing React frontend scaffold; dashboard and workflow control surfaces
-- `apps/api/` – retained placeholder Node service; not the canonical backend for MVP
-- `backend/` – Python FastAPI application for API ingress, config, schemas, and orchestrator-facing routes
-- `docs/` – platform architecture and contract definitions
-- `packages/shared/` – existing frontend type utilities retained for shared UI use
+## High-Level System Architecture
 
-## Responsibilities by team member
+```mermaid
+graph TD
+    UI["Frontend Dashboard (React + TypeScript + Vite)"] -->|"HTTP / REST (VITE_API_BASE_URL)"| API["FastAPI Ingress (backend/app/main.py)"]
+    API --> CORS["CORS & Error Handlers"]
+    CORS --> Routes["API Routers (/api/v1)"]
+    
+    Routes --> R_Health["/health (System status)"]
+    Routes --> R_Agents["/agents (Agent registry)"]
+    Routes --> R_Runs["/test-runs (Test execution)"]
+    Routes --> R_Envs["/environments (Synthetic DB)"]
+    Routes --> R_Evals["/evaluations (Scores & reports)"]
+    
+    R_Agents & R_Runs & R_Envs & R_Evals --> Store[("Thread-Safe InMemoryStore (RLock)")]
+    
+    R_Agents -.->|"AgentAdapterProtocol"| Adapter["Prajwal: Protocol Adapters & Simulator"]
+    R_Runs -.->|"WorkflowOrchestratorProtocol"| LangGraph["Rahul: LangGraph Orchestrator"]
+    R_Envs -.->|"DockerLifecycleProtocol"| Docker["Rajath: Docker Engine & Synthetic DBs"]
+    R_Evals -.->|"EvaluatorProtocol"| Evaluator["Rahul: Evaluation & Report Generator"]
+```
 
-### Naaneshwar — backend and target-agent integrations
+---
 
-- API route design
-- service-layer separation
-- target-agent adapters and execution hooks
-- external API integration boundaries
+## Frontend-to-Backend Flow
 
-### Rajath — environment provisioning and storage
+1. **Client Ingress**: The React frontend (`apps/web/`) interacts with the backend via the typed API client (`apps/web/src/api.ts`). The base URL is dynamically sourced from `import.meta.env.VITE_API_BASE_URL`, defaulting to `http://localhost:8000/api/v1`.
+2. **CORS & Middleware**: Requests pass through FastAPI's `CORSMiddleware`, configured with allowed origins (e.g. `http://localhost:5173`, `http://localhost:3000`).
+3. **Route Handling & Schema Validation**: Ingress payloads are validated using Pydantic schemas (`app/schemas/`). Invalid payloads trigger standard HTTP 422 JSON envelopes.
+4. **Data Isolation & Concurrency**: All state operations are managed through the central `InMemoryStore` (`app/core/store.py`), protected by `threading.RLock` to guarantee thread safety.
+5. **Response Envelope**: Every response is encapsulated within a standardized JSON envelope (`ApiEnvelope` or `ErrorEnvelope`) ensuring uniform client parsing.
 
-- Docker Engine and container lifecycle management
-- synthetic database lifecycle orchestration for PostgreSQL, MySQL, and MongoDB
-- Redis usage for execution state and cache
-- infrastructure automation scripts and local environment support
+---
 
-### Prajwal — profiling and simulation
+## Module Responsibilities
 
-- target-agent profiling and protocol adapters
-- synthetic API simulator behaviour and contract testing
-- environment-level service emulation
+### Naaneshwar — FastAPI Core, Contracts, and Integration Coordination
+- **Application Core**: FastAPI bootstrap, lifespan management, route registry, error handlers, and Swagger/OpenAPI docs.
+- **Shared Contracts**: Canonical request/response schemas (`app/schemas/common.py`, `agent.py`, `test_run.py`, `environment.py`, `evaluation.py`).
+- **Store Abstraction**: Centralized thread-safe `InMemoryStore` with concurrency locks and reset fixtures.
+- **Security & Redaction**: Automated sanitization of secrets, tokens, and passwords in agent configuration payloads.
+- **Integration Protocols**: Standardized protocol contracts (`app/services/interfaces.py`) defining integration touchpoints for teammates.
 
-### Rahul — workflows and evaluation
+### Rajath — Environment Provisioning & Storage
+- **Lifecycle Integration**: Implements `DockerLifecycleProtocol`.
+- **Synthetic Databases**: Automated spinning up and tear-down of PostgreSQL, MySQL, MongoDB, Redis, and Neo4j test containers.
+- **Resource Management**: Safe container labeling, port allocation, and idempotent deprovisioning.
 
-- LangGraph orchestration and simulated user flows
-- security and advisory testing
-- score calculation and evaluation reports
-- test-run summarisation and result distillation
+### Prajwal — Target-Agent Adapters & Simulation
+- **Agent Invocation**: Implements `AgentAdapterProtocol`.
+- **Protocol Adapters**: Translates standard platform test payloads to target agent protocols (OpenAI, Anthropic, REST, LangChain).
+- **Synthetic Simulator**: Emulates API responses and tools for controlled agent benchmarking.
 
-## Interface principles
+### Rahul — Workflows, Evaluation, and Reports
+- **Workflow Orchestration**: Implements `WorkflowOrchestratorProtocol` using LangGraph state machines.
+- **Simulated Users**: Multi-turn scenario execution against target agents.
+- **Evaluation & Benchmarking**: Implements `EvaluatorProtocol` calculating scores (0-100), latency, coverage, and generating structured reports.
 
-1. The `backend/` service owns the canonical API contract for the MVP.
-2. Frontend code should communicate only through typed API schemas defined in `backend/app/schemas/`.
-3. Workflow logic should not live in a single `main.py` file; it should be layered into modules as the project grows.
-4. External dependencies such as Neo4j, Redis, and LLM providers are optional in the local development environment and must not be required for the health route or smoke tests.
-5. New modules must be added in a way that preserves the current repository and existing frontend scaffold.
+---
 
-## Current MVP boundary
+## Integration Interfaces (`backend/app/services/interfaces.py`)
 
-The initial foundation includes only:
+The platform defines clean Python `Protocol` contracts enabling isolated local development with deterministic mocks:
 
-- application bootstrap
-- configuration loading from environment variables
-- consistent error formatting
-- minimal health endpoint
-- minimal schemas for agent configuration, test-run requests, execution status, and evaluation results
-- smoke tests that run without external services
+| Protocol | Owner | Purpose | Mock Available |
+| --- | --- | --- | --- |
+| `DockerLifecycleProtocol` | Rajath | Container provisioning & synthetic DB lifecycle | `MockDockerLifecycle` |
+| `AgentAdapterProtocol` | Prajwal | Invocation and reachability checks for target AI agents | `MockAgentAdapter` |
+| `WorkflowOrchestratorProtocol` | Rahul | LangGraph execution graph triggering and cancellation | `MockWorkflowOrchestrator` |
+| `EvaluatorProtocol` | Rahul | Benchmark evaluation, score calculation, report synthesis | `MockEvaluator` |
 
-This deliberately excludes live LLM and database integrations until the team approves the deployment and runtime model.
+---
 
-## Phase 2 API contracts
+## Implementation Status (Current vs. Planned)
 
-The following contract areas are now defined as shared interfaces for the team:
+| Component | Status | Notes |
+| --- | --- | --- |
+| FastAPI Application & Lifespan | **Operational** | Configured with CORS, root health, `/docs`, and versioned routes |
+| Shared Response Envelopes | **Operational** | Standardized `{ success, data, error }` across all endpoints |
+| Domain Error Handling | **Operational** | Handlers for 400, 404, 409, 422, and safe production 500s |
+| In-Memory Data Store | **Operational** | Concurrency-protected via `RLock`; test-isolated with `reset()` |
+| Agent Registration & Listing | **Operational** | Auto-generates IDs, prevents duplicates, redacts sensitive keys |
+| Test Run API & State Transitions | **Operational** | Validates target agents, prevents invalid cancellations |
+| Execution Events & Traces | **Operational** | Run-scoped trace retrieval with sequence tracking |
+| Environment Lifecycle API | **Operational** | Tracks `provisioning` and `stopped` states; no fake container URLs |
+| Evaluation & Reporting API | **Operational** | Enforces valid run references; retrieves reports by ID or run ID |
+| Frontend API Client | **Operational** | Typed TypeScript client in `apps/web/src/api.ts` |
+| Docker Daemon Engine | *Planned* | Awaiting Rajath's Docker implementation |
+| Live LLM Adapters | *Planned* | Awaiting Prajwal's protocol adapter module |
+| LangGraph Workflow Engine | *Planned* | Awaiting Rahul's workflow graph implementation |
+| Persistent DB Storage | *Future Phase* | SQLite / PostgreSQL adapter replacing `InMemoryStore` |
 
-- agent registration and configuration
-- test-run creation, cancellation, and state retrieval
-- synthetic environment provisioning and lifecycle tracking
-- execution event and trace capture
-- evaluation submission and final report retrieval
-
-Each contract is implemented in dedicated route modules under `backend/app/api/routes/` and its corresponding models under `backend/app/schemas/` so that the service remains modular without moving all logic into the main application entry point.

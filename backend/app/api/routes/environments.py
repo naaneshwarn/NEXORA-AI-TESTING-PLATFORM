@@ -102,8 +102,16 @@ async def create_environment_endpoint(
     return ApiEnvelope(success=True, data=_redacted(record))
 
 
+@router.get("/environments", response_model=ApiEnvelope[list[SyntheticEnvironment]])
+async def list_environments_endpoint() -> ApiEnvelope[list[SyntheticEnvironment]]:
+    """List all tracked synthetic environments and their current lifecycle statuses."""
+    all_envs = list_environments()
+    return ApiEnvelope(success=True, data=all_envs)
+
+
 @router.get("/environments/{environment_id}", response_model=ApiEnvelope[SyntheticEnvironment])
 async def get_environment_endpoint(environment_id: str) -> ApiEnvelope[SyntheticEnvironment]:
+    """Retrieve metadata and lifecycle state for a specific environment."""
     environment = get_environment(environment_id)
     if environment is None:
         raise HTTPException(status_code=404, detail={"message": f"Environment '{environment_id}' was not found."})
@@ -112,6 +120,10 @@ async def get_environment_endpoint(environment_id: str) -> ApiEnvelope[Synthetic
 
 @router.post("/environments/{environment_id}/stop", response_model=ApiEnvelope[SyntheticEnvironment])
 async def stop_environment_endpoint(environment_id: str) -> ApiEnvelope[SyntheticEnvironment]:
+    """Safely stop an active synthetic environment.
+
+    This operation is idempotent: stopping an already stopped environment succeeds safely.
+    """
     environment = get_environment(environment_id)
     if environment is None:
         raise HTTPException(status_code=404, detail={"message": f"Environment '{environment_id}' was not found."})
