@@ -269,6 +269,23 @@ def get_events_for_run(run_id: str) -> list[ExecutionEvent]:
     return store.get_events_for_run(run_id)
 
 
+def record_execution_event(run_id: str, event: ExecutionEvent) -> ExecutionEvent:
+    events = EVENTS.setdefault(run_id, [])
+    events.append(event)
+    return event
+
+
+def record_tool_trace(run_id: str, trace_data: dict) -> dict:
+    """Append a tool-call trace for a run, stamping it with a UTC timestamp."""
+    trace = {**trace_data, "run_id": run_id, "timestamp": utc_now().isoformat()}
+    TOOL_TRACES.setdefault(run_id, []).append(trace)
+    return trace
+
+
+def get_traces_for_run(run_id: str) -> list[dict]:
+    return TOOL_TRACES.get(run_id, [])
+
+
 def create_environment(payload: SyntheticEnvironment) -> SyntheticEnvironment:
     return store.create_environment(payload)
 
@@ -279,6 +296,12 @@ def get_environment(environment_id: str) -> SyntheticEnvironment | None:
 
 def list_environments() -> list[SyntheticEnvironment]:
     return store.list_environments()
+
+
+def update_environment(env: SyntheticEnvironment) -> SyntheticEnvironment:
+    env.updated_at = utc_now()
+    ENVIRONMENTS[env.environment_id] = env
+    return env
 
 
 def stop_environment(environment_id: str) -> SyntheticEnvironment:

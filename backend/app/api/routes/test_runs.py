@@ -14,6 +14,7 @@ from app.core.store import (
 from app.schemas.common import ApiEnvelope
 from app.schemas.events import ExecutionEvent
 from app.schemas.test_run import ExecutionStatus, RunCreateRequest, RunDetail
+from app.schemas.tracing import ToolCallTraceResponse
 
 router = APIRouter(tags=["test-runs"])
 
