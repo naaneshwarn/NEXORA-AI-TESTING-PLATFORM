@@ -2,10 +2,11 @@
 
 The FastAPI foundation exposes a versioned API at `/api/v1` and uses a consistent JSON envelope for both success and failure responses.
 
-## Response envelope
+## Response Envelope
 
-Success responses follow this shape:
+All API endpoints encapsulate responses in a standard JSON envelope:
 
+### Success Response
 ```json
 {
   "success": true,
@@ -14,18 +15,18 @@ Success responses follow this shape:
 }
 ```
 
-Error responses follow this shape:
-
+### Error Response
 ```json
 {
   "success": false,
+  "data": null,
   "error": {
     "code": "validation_error",
     "message": "Request validation failed",
     "details": {
       "errors": [
         {
-          "loc": ["body", "agent_id"],
+          "loc": ["body", "name"],
           "msg": "Field required",
           "type": "missing"
         }
@@ -35,46 +36,62 @@ Error responses follow this shape:
 }
 ```
 
-## Health endpoint
+Standard Error Codes:
+- `validation_error` (422) – Request body or query parameters failed schema validation
+- `not_found` (404) – The requested resource (agent, run, environment, report) was not found
+- `conflict` (409) – A resource with the specified identifier already exists
+- `invalid_state_transition` (400) – An illegal lifecycle transition was requested (e.g. cancelling a completed run)
+- `internal_server_error` (500) – An unhandled internal server error occurred (stack traces are masked in production)
 
-| Method | Path | Request | Response | Status codes | Responsible module |
+---
+
+## Health & Discovery Endpoints
+
+| Method | Path | Request | Response | Status codes | Description |
 | --- | --- | --- | --- | --- | --- |
-| GET | `/api/v1/health` | none | `HealthResponse` | 200 | Naaneshwar |
+| GET | `/health` | none | `HealthResponse` | 200 | Root health endpoint |
+| GET | `/api/v1/health` | none | `HealthResponse` | 200 | Versioned API health status |
+| GET | `/docs` | none | HTML | 200 | Swagger UI interactive documentation |
+| GET | `/redoc` | none | HTML | 200 | ReDoc documentation |
+| GET | `/openapi.json` | none | OpenAPI JSON | 200 | Machine-readable OpenAPI 3.1 specification |
 
-## Phase 2 contracts
+---
 
-### 1. Register and configure a target AI agent
+## Phase 2 Contracts
 
-| Method | Path | Request schema | Response schema | Status codes | Responsible module |
+### 1. Register and Manage Target AI Agents
+
+| Method | Path | Request schema | Response schema | Status codes | Description |
 | --- | --- | --- | --- | --- | --- |
-| POST | `/api/v1/agents` | `AgentConfig` | `ApiEnvelope[AgentConfig]` | 201, 409, 422 | Naaneshwar |
-| GET | `/api/v1/agents/{agent_id}` | none | `ApiEnvelope[AgentConfig]` | 200, 404 | Naaneshwar |
+| POST | `/api/v1/agents` | `AgentConfig` | `ApiEnvelope[AgentConfig]` | 201, 409, 422 | Register agent (auto-generates `agent_id` if omitted; redacts secrets) |
+| GET | `/api/v1/agents` | none | `ApiEnvelope[list[AgentConfig]]` | 200 | List all registered agents |
+| GET | `/api/v1/agents/{agent_id}` | none | `ApiEnvelope[AgentConfig]` | 200, 404 | Retrieve an agent by ID (secrets redacted) |
 
-`AgentConfig` fields:
-
+`AgentConfig` Schema:
 ```python
 class AgentConfig(BaseModel):
-    agent_id: str
-    name: str
+    agent_id: str | None = None  # Auto-generated (agent-xxxxxxxx) if omitted
+    name: str                    # Required
     role: Literal["planner", "executor", "observer", "reporter"]
     model: str | None = None
     provider: str | None = None
     endpoint: str | None = None
     status: Literal["registered", "active", "disabled"] = "registered"
-    config: dict[str, Any] = {}
+    config: dict[str, Any] = {}  # Keys like api_key, token, password are auto-redacted in responses
     created_at: datetime | None = None
 ```
 
-### 2. Create a test run using a scenario configuration
+### 2. Test-Run Orchestration & Trace Events
 
-| Method | Path | Request schema | Response schema | Status codes | Responsible module |
+| Method | Path | Request schema | Response schema | Status codes | Description |
 | --- | --- | --- | --- | --- | --- |
-| POST | `/api/v1/test-runs` | `RunCreateRequest` | `ApiEnvelope[RunDetail]` | 201, 422 | Rahul |
-| GET | `/api/v1/test-runs/{run_id}` | none | `ApiEnvelope[RunDetail]` | 200, 404 | Rahul |
-| POST | `/api/v1/test-runs/{run_id}/cancel` | none | `ApiEnvelope[ExecutionStatus]` | 200, 404 | Rahul |
+| POST | `/api/v1/test-runs` | `RunCreateRequest` | `ApiEnvelope[RunDetail]` | 201, 404, 422 | Create run (validates target agents exist) |
+| GET | `/api/v1/test-runs` | none | `ApiEnvelope[list[RunDetail]]` | 200 | List all recorded test runs |
+| GET | `/api/v1/test-runs/{run_id}` | none | `ApiEnvelope[RunDetail]` | 200, 404 | Retrieve run status and detail |
+| POST | `/api/v1/test-runs/{run_id}/cancel` | none | `ApiEnvelope[ExecutionStatus]` | 200, 400, 404 | Cancel queued/running run (400 if already terminal) |
+| GET | `/api/v1/test-runs/{run_id}/events` | none | `ApiEnvelope[list[ExecutionEvent]]` | 200, 404 | Retrieve chronological execution events |
 
-`RunCreateRequest` fields:
-
+`RunCreateRequest` Schema:
 ```python
 class RunCreateRequest(BaseModel):
     suite_name: str
@@ -82,17 +99,16 @@ class RunCreateRequest(BaseModel):
     environment: str = "local"
     tags: list[str] = []
     target_agents: list[str] = []
-    config: dict[str, Any] = {}
+    config: dict[str, Any] = {}  # Set allow_mock: True to bypass target agent existence check
 ```
 
-`RunDetail` fields:
-
+`RunDetail` Schema:
 ```python
 class RunDetail(BaseModel):
     run_id: str
     suite_name: str
     environment: str
-    state: Literal["queued", "running", "passed", "failed", "cancelled"]
+    state: Literal["queued", "running", "passed", "failed", "cancelled"] = "queued"
     target_agents: list[str]
     created_at: datetime | None = None
     started_at: datetime | None = None
@@ -100,16 +116,16 @@ class RunDetail(BaseModel):
     message: str | None = None
 ```
 
-### 3. Request a synthetic environment and track lifecycle
+### 3. Request Synthetic Environment & Lifecycle
 
-| Method | Path | Request schema | Response schema | Status codes | Responsible module |
+| Method | Path | Request schema | Response schema | Status codes | Description |
 | --- | --- | --- | --- | --- | --- |
-| POST | `/api/v1/environments` | `SyntheticEnvironmentRequest` | `ApiEnvelope[SyntheticEnvironment]` | 201, 422 | Rajath |
-| GET | `/api/v1/environments/{environment_id}` | none | `ApiEnvelope[SyntheticEnvironment]` | 200, 404 | Rajath |
-| POST | `/api/v1/environments/{environment_id}/stop` | none | `ApiEnvelope[SyntheticEnvironment]` | 200, 404 | Rajath |
+| POST | `/api/v1/environments` | `SyntheticEnvironmentRequest` | `ApiEnvelope[SyntheticEnvironment]` | 201, 422 | Provision environment request (`endpoint=null` until Docker confirms) |
+| GET | `/api/v1/environments` | none | `ApiEnvelope[list[SyntheticEnvironment]]` | 200 | List tracked environments |
+| GET | `/api/v1/environments/{environment_id}` | none | `ApiEnvelope[SyntheticEnvironment]` | 200, 404 | Retrieve environment state |
+| POST | `/api/v1/environments/{environment_id}/stop` | none | `ApiEnvelope[SyntheticEnvironment]` | 200, 404 | Idempotent stop and deprovisioning |
 
-`SyntheticEnvironmentRequest` fields:
-
+`SyntheticEnvironmentRequest` Schema:
 ```python
 class SyntheticEnvironmentRequest(BaseModel):
     environment_type: Literal["postgres", "mysql", "mongodb", "redis", "neo4j", "docker"]
@@ -117,8 +133,7 @@ class SyntheticEnvironmentRequest(BaseModel):
     config: dict[str, Any] = {}
 ```
 
-`SyntheticEnvironment` fields:
-
+`SyntheticEnvironment` Schema:
 ```python
 class SyntheticEnvironment(BaseModel):
     environment_id: str
@@ -131,74 +146,45 @@ class SyntheticEnvironment(BaseModel):
     updated_at: datetime | None = None
 ```
 
-### 4. Execution events and tool-call traces
+### 4. Evaluation Submission & Report Retrieval
 
-| Method | Path | Request schema | Response schema | Status codes | Responsible module |
+| Method | Path | Request schema | Response schema | Status codes | Description |
 | --- | --- | --- | --- | --- | --- |
-| GET | `/api/v1/test-runs/{run_id}/events` | none | `ApiEnvelope[list[ExecutionEvent]]` | 200, 404 | Prajwal |
+| POST | `/api/v1/evaluations` | `EvaluationSubmission` | `ApiEnvelope[ReportSummary]` | 201, 404, 422 | Submit evaluation (validates `run_id` exists) |
+| GET | `/api/v1/reports/{report_id}` | none | `ApiEnvelope[ReportSummary]` | 200, 404 | Retrieve report by report ID |
+| GET | `/api/v1/reports/runs/{run_id}` | none | `ApiEnvelope[ReportSummary]` | 200, 404 | Retrieve report by test run ID |
 
-`ExecutionEvent` fields:
-
-```python
-class ExecutionEvent(BaseModel):
-    event_id: str
-    run_id: str
-    event_type: Literal["created", "started", "heartbeat", "tool_call", "result", "error", "completed"]
-    sequence: int
-    message: str
-    payload: dict[str, Any] = {}
-    timestamp: datetime | None = None
-    tool_calls: list[ToolCallTrace] = []
-```
-
-`ToolCallTrace` fields:
-
-```python
-class ToolCallTrace(BaseModel):
-    call_id: str
-    tool_name: str
-    status: Literal["started", "success", "failed"]
-    payload: dict[str, Any] = {}
-```
-
-### 5. Submit evaluation results and retrieve final report
-
-| Method | Path | Request schema | Response schema | Status codes | Responsible module |
-| --- | --- | --- | --- | --- | --- |
-| POST | `/api/v1/evaluations` | `EvaluationSubmission` | `ApiEnvelope[ReportSummary]` | 201, 422 | Rahul |
-| GET | `/api/v1/reports/{report_id}` | none | `ApiEnvelope[ReportSummary]` | 200, 404 | Rahul |
-
-`EvaluationSubmission` fields:
-
+`EvaluationSubmission` Schema:
 ```python
 class EvaluationSubmission(BaseModel):
     run_id: str
     agent_id: str | None = None
-    score: float = Field(ge=0, le=100)
-    status: Literal["pass", "fail", "partial"]
+    score: float = Field(default=0.0, ge=0.0, le=100.0)
+    status: Literal["pass", "fail", "partial"] = "partial"
     summary: str
     metrics: dict[str, float] = {}
     issues: list[str] = []
 ```
 
-`ReportSummary` fields:
-
+`ReportSummary` Schema:
 ```python
 class ReportSummary(BaseModel):
     report_id: str
     run_id: str
-    score: float
-    status: Literal["generated", "partial", "failed"]
+    score: float = Field(default=0.0, ge=0.0, le=100.0)
+    status: Literal["generated", "partial", "failed"] = "generated"
     summary: str
     metrics: dict[str, float] = {}
     generated_at: datetime | None = None
 ```
 
-## Shared contract decisions pending team approval
+---
 
-- Whether run lifecycle should expose a richer state machine beyond queued/running/passed/failed/cancelled.
-- Whether report scoring should be bounded to 0-100 or use a different domain-specific scale for security and input validation tasks.
-- Whether environment provisioning should return a concrete endpoint or only a lifecycle identifier initially.
-- Whether tool-call traces should be streamed in real time or retrieved via paged query endpoints.
+## Shared Integration Interfaces (`backend/app/services/interfaces.py`)
 
-The current contract is intentionally minimal and intentionally does not claim integration with live LLM providers, Neo4j, Redis, or remote infrastructure.
+Python protocols define concrete boundaries with teammates:
+- `DockerLifecycleProtocol`: Rajath's Docker container engine integration
+- `AgentAdapterProtocol`: Prajwal's target-agent communication adapter
+- `WorkflowOrchestratorProtocol`: Rahul's LangGraph test-run workflow engine
+- `EvaluatorProtocol`: Rahul's scoring and reporting benchmark engine
+

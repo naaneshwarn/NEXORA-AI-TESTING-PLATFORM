@@ -1,90 +1,148 @@
 # NEXORA AI Testing Platform
 
-NEXORA is a modular monolith foundation for an AI-powered testing platform that supports workflow orchestration, synthetic environments, and evaluation-driven test runs.
+NEXORA is a modular monolith foundation for an AI-powered testing platform that supports workflow orchestration, synthetic test environments, and evaluation-driven test runs.
 
-## Repository status
+## Project Overview
 
-The repository already contains a frontend scaffold under `apps/web` and a Node-based placeholder API under `apps/api`. Those files are preserved as the starting point for the team UI and future frontend work.
+NEXORA provides a unified platform to evaluate, stress-test, and benchmark autonomous AI agents across controlled environments and reproducible scenarios. The system coordinates agent management, test execution lifecycles, synthetic databases, and analytical reporting.
 
-This foundation adds a Python FastAPI backend under `backend/` so the project can start with a minimal working API while the rest of the platform is implemented in stages.
+## Repository Layout
 
-## Repository layout
+```
+├── apps/
+│   ├── web/               # React + TypeScript + Vite frontend dashboard
+│   └── api/               # Legacy Node/Express placeholder service retained for compatibility
+├── backend/
+│   ├── app/
+│   │   ├── api/routes/    # FastAPI route controllers (health, agents, test-runs, environments, evaluations)
+│   │   ├── core/          # Configuration, thread-safe in-memory store, domain error handling
+│   │   ├── schemas/       # Standardized Pydantic schemas and response envelopes
+│   │   ├── services/      # Module integration interfaces and deterministic mock providers
+│   │   └── main.py        # Application entry point with CORS, lifespan, and route registry
+│   ├── tests/             # Pytest test suite for health, contracts, error envelopes, and concurrency
+│   └── requirements.txt   # Python backend dependencies
+├── docs/
+│   ├── architecture.md    # Platform architecture, module boundaries, and teammate responsibilities
+│   └── api-contracts.md   # Canonical API contracts, endpoints, request/response models, and error codes
+├── packages/
+│   └── shared/            # Shared TypeScript utilities and types for frontend apps
+├── package.json           # Root workspace configuration
+├── pytest.ini             # Pytest configuration
+└── .env.example           # Sample environment variables
+```
 
-- `apps/web/` – existing React + TypeScript frontend scaffold
-- `apps/api/` – existing Node/Express placeholder service retained for compatibility
-- `backend/` – Python FastAPI application and tests
-- `docs/` – architecture and API contract documentation
-- `packages/shared/` – existing shared TypeScript utilities retained for frontend use
+## Team Responsibilities
 
-## Module boundaries
+- **Naaneshwar**: FastAPI backend core, API routing, shared response contracts, error handling, store abstraction, and integration interfaces.
+- **Rajath**: Docker Engine container lifecycle, synthetic databases (PostgreSQL, MySQL, MongoDB, Redis, Neo4j), and infrastructure.
+- **Prajwal**: Target-agent adapters, protocol wrappers, and synthetic API simulator.
+- **Rahul**: LangGraph workflow orchestration, simulated user execution, evaluation metrics, and reporting.
 
-- `apps/web/` – user dashboard and orchestration views
-- `backend/app/` – API, config, schemas, and core application logic
-- `backend/tests/` – API smoke tests and contract validation
-- `docs/` – architectural guidance for team responsibilities and module interfaces
-- Future modules such as workflow orchestration, synthetic database management, and profiling adapters should be added as separate subpackages under `backend/` or dedicated service folders, not as business logic embedded in `main.py`.
+---
 
-## Minimal setup
+## Prerequisites
 
-### Python backend
+- **Python**: 3.10+ (Python 3.11 recommended)
+- **Node.js**: 18.0+ & npm 9+
+- **Git**
+
+---
+
+## Quickstart
+
+### 1. Python Backend
+
+From the repository root or `backend/` directory:
 
 ```bash
+# Navigate to backend (or project root)
 cd backend
+
+# Create virtual environment (if not already present)
 python -m venv .venv
-# Windows
-.venv\Scripts\activate
+
+# Activate virtual environment
+# Windows (PowerShell)
+.venv\Scripts\Activate.ps1
 # macOS/Linux
 source .venv/bin/activate
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Start backend server
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### Frontend (existing scaffold)
+The backend starts at `http://localhost:8000`.
+
+### 2. Interactive API Documentation
+
+- **Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **ReDoc**: [http://localhost:8000/redoc](http://localhost:8000/redoc)
+- **OpenAPI Schema**: [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json)
+- **Health Check**: [http://localhost:8000/health](http://localhost:8000/health) or [http://localhost:8000/api/v1/health](http://localhost:8000/api/v1/health)
+
+### 3. Frontend Dashboard
+
+From the repository root:
 
 ```bash
+# Install workspace dependencies
 npm install
+
+# Start Vite development server
 npm run dev
 ```
 
-### Run tests
+The frontend will start at `http://localhost:5173`.
+
+To configure the API endpoint targeted by the frontend, create an `.env` or `.env.local` in `apps/web/`:
+```bash
+VITE_API_BASE_URL=http://localhost:8000/api/v1
+```
+
+### 4. Running Tests
+
+Run the backend pytest test suite:
 
 ```bash
+# From repository root:
+python -m pytest -v
+
+# Or from backend/ directory:
 cd backend
-python -m pytest
+python -m pytest -v
 ```
 
-## Environment configuration
-
-Copy the sample environment file before running services:
-
+Run frontend linting and type-checks:
 ```bash
-copy .env.example .env
+npm run lint
+npm run build
 ```
 
-The application is intentionally designed to work without LLM API keys, Neo4j, Redis, or external services enabled. The health endpoint and schema layer should work in local development mode using default values.
+---
 
-## Initial assumptions
+## Environment Variables
 
-- The application is a local-development-first foundation; production secrets remain externalised via `.env` and deployment environment variables.
-- The service is intentionally minimal. It exposes configuration and response contracts without creating fake integrations.
-- The team will agree on additional service boundaries before adding workflow orchestration, Docker provisioning, or target-agent adapters.
+Copy `.env.example` to `.env` to customize settings:
 
-## Current status
+| Variable | Default | Description |
+| --- | --- | --- |
+| `APP_NAME` | `NEXORA` | Application title reported in health and documentation |
+| `APP_ENV` | `development` | Deployment environment (`development`, `test`, `production`) |
+| `API_PREFIX` | `/api/v1` | URL prefix for versioned API endpoints |
+| `PORT` | `8000` | Local port for FastAPI server |
+| `LOG_LEVEL` | `INFO` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `CORS_ORIGINS` | `http://localhost:3000,http://localhost:5173` | Comma-separated allowed frontend origins |
+| `VITE_API_BASE_URL` | `http://localhost:8000/api/v1` | Frontend target URL for backend API |
 
-This repository currently contains the shared building blocks required for team work:
+---
 
-- React frontend scaffold retained
-- Python FastAPI foundation added
-- Minimal health endpoint and schema layer
-- Basic pytest smoke test
-- Architecture and API contract documentation
-- Git exclusions for Python and Node generated artifacts
+## Known Limitations & Planned Integrations
 
-## Notes for the team
+1. **In-Memory Store**: In the MVP, all registered agents, test runs, environments, events, and reports are held in a thread-safe in-memory store. All data is reset upon server restart. Persistent databases (PostgreSQL/Redis) are planned for future phases.
+2. **Synthetic Environments**: The environment API tracks lifecycle states (`provisioning`, `stopped`). Container endpoints remain `None` in development mode until Rajath's Docker daemon lifecycle integration is connected.
+3. **Target Agent Execution**: Agent registration sanitizes and redacts credentials. Real external LLM invocation interfaces are defined in `app/services/interfaces.py` and run through deterministic mock paths until Prajwal's adapter integration lands.
+4. **LangGraph Workflow Orchestration**: Test runs are created in `queued` state with trace events. Rahul's LangGraph graph engine will connect via `WorkflowOrchestratorProtocol` to transition runs to execution and trigger automatic evaluations.
 
-- Naaneshwar: backend API and target-agent integrations
-- Rajath: Docker provisioning, synthetic database lifecycle, storage infrastructure
-- Prajwal: target-agent profiling, protocol adapters, simulation APIs
-- Rahul: LangGraph workflows, simulated users, evaluation metrics and reporting
-
-The interface contracts documented in `docs/api-contracts.md` are intentionally simple and can be extended once the implementation starts.
