@@ -16,6 +16,8 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .workflow_state/
+# Durable core-store snapshot (NEXORA_STATE_DIR) — runtime data, never committed.
+.state/
 
 # Env and secrets
 .env

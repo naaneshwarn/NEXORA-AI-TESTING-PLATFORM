@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from app.core.persistence import persistence
 from app.schemas.agent import AgentConfig
 from app.schemas.environment import SyntheticEnvironment
 from app.schemas.events import ExecutionEvent
@@ -17,6 +18,11 @@ REPORTS: dict[str, ReportSummary] = {}
 TOOL_TRACES: dict[str, list[dict]] = {}
 WORKFLOW_REPORTS: dict[str, dict] = {}
 
+# Every mutator below finishes with ``persistence.save()`` so a restarted
+# process observes exactly the state the previous one served.  When
+# persistence is disabled (``NEXORA_STATE_DIR=""`` — the test-suite default)
+# the call is a lock-guarded no-op.
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -25,6 +31,7 @@ def utc_now() -> datetime:
 def register_agent(agent: AgentConfig) -> AgentConfig:
     agent.created_at = agent.created_at or utc_now()
     AGENTS[agent.agent_id] = agent
+    persistence.save()
     return agent
 
 
@@ -55,6 +62,7 @@ def create_test_run(payload: RunCreateRequest) -> RunDetail:
             timestamp=now,
         )
     ]
+    persistence.save()
     return run
 
 
@@ -77,6 +85,7 @@ def cancel_test_run(run_id: str) -> RunDetail:
             timestamp=utc_now(),
         )
     )
+    persistence.save()
     return run
 
 
@@ -87,6 +96,7 @@ def get_events_for_run(run_id: str) -> list[ExecutionEvent]:
 def record_execution_event(run_id: str, event: ExecutionEvent) -> ExecutionEvent:
     events = EVENTS.setdefault(run_id, [])
     events.append(event)
+    persistence.save()
     return event
 
 
@@ -94,6 +104,7 @@ def record_tool_trace(run_id: str, trace_data: dict) -> dict:
     """Append a tool-call trace for a run, stamping it with a UTC timestamp."""
     trace = {**trace_data, "run_id": run_id, "timestamp": utc_now().isoformat()}
     TOOL_TRACES.setdefault(run_id, []).append(trace)
+    persistence.save()
     return trace
 
 
@@ -106,6 +117,7 @@ def create_environment(payload: SyntheticEnvironment) -> SyntheticEnvironment:
     payload.created_at = payload.created_at or now
     payload.updated_at = payload.updated_at or now
     ENVIRONMENTS[payload.environment_id] = payload
+    persistence.save()
     return payload
 
 
@@ -116,6 +128,7 @@ def get_environment(environment_id: str) -> SyntheticEnvironment | None:
 def update_environment(env: SyntheticEnvironment) -> SyntheticEnvironment:
     env.updated_at = utc_now()
     ENVIRONMENTS[env.environment_id] = env
+    persistence.save()
     return env
 
 
@@ -137,6 +150,7 @@ def submit_evaluation(payload: EvaluationSubmission) -> ReportSummary:
         generated_at=now,
     )
     REPORTS[report.report_id] = report
+    persistence.save()
     return report
 
 
@@ -166,12 +180,14 @@ def update_test_run_state(
         run.started_at = utc_now()
     if mark_completed:
         run.completed_at = utc_now()
+    persistence.save()
     return run
 
 
 def save_workflow_report(report: dict) -> dict:
     """Persist a rich workflow evaluation report keyed by its report ID."""
     WORKFLOW_REPORTS[report["report_id"]] = report
+    persistence.save()
     return report
 
 
@@ -198,6 +214,7 @@ def create_crm_lead(lead_data: dict) -> dict:
     lead_id = 'lead-' + uuid4().hex[:8]
     lead = {**lead_data, 'id': lead_id, 'created_at': now, 'updated_at': None}
     CRM_LEADS[lead_id] = lead
+    persistence.save()
     return lead
 
 
@@ -215,11 +232,13 @@ def update_crm_lead(lead_id: str, lead_data: dict) -> dict:
     now = datetime.now(timezone.utc).isoformat()
     updated = {**existing, **lead_data, 'updated_at': now}
     CRM_LEADS[lead_id] = updated
+    persistence.save()
     return updated
 
 
 def delete_crm_lead(lead_id: str) -> None:
     CRM_LEADS.pop(lead_id, None)
+    persistence.save()
 
 
 class Store:
@@ -250,9 +269,3 @@ class Store:
 
 
 store = Store()
-
-
-
-
-
-

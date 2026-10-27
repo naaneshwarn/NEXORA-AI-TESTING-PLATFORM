@@ -1,0 +1,77 @@
+# NEXORA platform — containerized deployment.
+#
+#   docker compose up --build
+#
+#   Backend API + Swagger : http://localhost:8000/docs
+#   Frontend dashboard    : http://localhost:3000
+#
+# Notes:
+# * The dashboard calls the API from the *browser*, so VITE_API_BASE_URL is
+#   baked at build time and points at the published backend port (localhost).
+# * Provisioning synthetic environments via Docker requires a Docker daemon;
+#   inside this compose stack the backend has no /var/run/docker.sock mounted
+#   by default, so environment provisioning reports
+#   "Docker Engine is unavailable" (expected). Mount the socket explicitly if
+#   you want live container provisioning — see the `docker_provisioning`
+#   profile below.
+# * Set NEXORA_API_KEYS (and optionally NEXORA_AUTH_MODE) to require API keys
+#   on mutating requests. Reads stay open so the dashboard keeps working.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: nexora-backend:latest
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      CORS_ORIGINS: http://localhost:3000,http://localhost:5173
+      NEXORA_API_KEYS: ${NEXORA_API_KEYS:-}
+      NEXORA_AUTH_MODE: ${NEXORA_AUTH_MODE:-auto}
+      NEXORA_STATE_DIR: /data/state
+    volumes:
+      - backend-state:/data/state
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+        VITE_API_KEY: ${VITE_API_KEY:-}
+    image: nexora-web:latest
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # Optional: let the backend provision real synthetic environments by giving
+  # it access to the host Docker daemon.  Start with:
+  #   docker compose --profile docker_provisioning up --build
+  backend-docker:
+    profiles: ["docker_provisioning"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: nexora-backend:latest
+    ports:
+      - "8000:8000"
+    environment:
+      APP_ENV: production
+      LOG_LEVEL: INFO
+      CORS_ORIGINS: http://localhost:3000,http://localhost:5173
+      NEXORA_API_KEYS: ${NEXORA_API_KEYS:-}
+      NEXORA_AUTH_MODE: ${NEXORA_AUTH_MODE:-auto}
+      NEXORA_STATE_DIR: /data/state
+    volumes:
+      - backend-state:/data/state
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+volumes:
+  backend-state:

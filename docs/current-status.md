@@ -1,178 +1,268 @@
 # NEXORA AI Testing Platform — Current Status
 
-**Last Updated:** October 21, 2026  
-**Active Branch:** `feature/workflow-evaluation-reporting`  
-**Latest Commit:** see `git log` (Work Package D commits `4535298` → HEAD, built on `4703dbc`)\
-**Upstream Base:** `25dab08` (*Publish NEXORA AI Testing Platform source code*)  
+**Last Updated:** October 28, 2026
+**Active Branch:** `feature/integration-wpb-wpd`
+**Upstream Base:** `25dab08` (*Publish NEXORA AI Testing Platform source code*)
 
 ---
 
 ## 1. Executive Summary
 
-The NEXORA platform backend foundation is fully operational in local-development mode. All versioned core REST endpoints under `/api/v1` are live, validated against strict Pydantic schemas, and backed by a centralized in-memory store.
+The NEXORA platform is **launch-ready for a demo/preview deployment**: all four
+Phase 3 work packages are implemented, wired together and verified end-to-end,
+backend and frontend run separately, and the whole surface is documented on
+OpenAPI/Swagger.
 
-Key milestones delivered on `feature/synthetic-api`:
-1. **Synthetic Environment Lifecycle**: State transitions (`provisioning` → `ready` → `stopped`), with the dedicated `/ready` transition endpoint, state persistence, and full test suite validation.
-2. **Stateful Synthetic CRM API**: Complete CRM Lead management endpoints (`/api/v1/leads`) backed by in-memory state storage with CRUD capabilities, Pydantic validation, and standard `ApiEnvelope` packaging.
-3. **Fault Simulation & Resiliency Testing**: Deterministic fault injection (`simulated_latency_ms` and `inject_error` query parameters) on CRM read endpoints with non-blocking `asyncio.sleep`, strict Pydantic range validation (`422`), error code simulation (`429`, `500`), and zero state mutation guarantees.
-4. **Protocol Adapter Layer (Phase 3)**: Modular adapter layer (`RESTProtocolAdapter`, `OpenAIFunctionAdapter`, `AdapterFactory`) with unified `AgentToolRequest` / `AgentToolResponse` models, synthetic tool registry (`TOOL_REGISTRY`), and a synthesis execution dispatcher at `/api/v1/synthetic/agent/execute/{protocol}`.
-5. **Agent Profiling & Tool-Call Tracing (Phase 3)**: Redacted tool-call telemetry (`ToolCallTraceCreate` / `ToolCallTraceResponse`), a recursive sensitive-data redaction engine scrubbing dictionary keys and inline token patterns, in-memory trace storage (`TOOL_TRACES`), and an async `execute_and_trace_tool` execution wrapper exposed at `/api/v1/test-runs/{run_id}/traces`. Integration with the event system records execution events for test run tracking.
-6. **Automated Verification**: Complete 38-test automated pytest suite passing across 7 modules (`test_api_contracts.py`, `test_health.py`, `test_protocol_adapters.py`, `test_tracing.py`, `test_crm.py`, `test_auth.py`, `test_streaming.py`), plus full live HTTP lifecycle verification.
-7. **Optional Authentication Dependency**: `backend/app/core/auth.py` inspects `X-API-Key` / `Authorization: Bearer` headers without forcing credentials on anonymous callers, exposes deterministic `invalid-token-test` (401) / `forbidden-token-test` (403) sentinels for denied-access testing, and is attached to the CRM, synthetic agent-execution, and streaming routers.
-8. **SSE Live Trace Streaming (Phase 3)**: `GET /api/v1/test-runs/{run_id}/stream` streams deduplicated `tool_trace` frames and a terminal `run_status` frame over `EventSourceResponse`, with 404 validation, client-disconnect handling, and a 1s non-blocking poll loop.
+**Verification totals (as of this update):**
+- Backend: **260 passed, 3 skipped** (the 3 skips are Docker-gated live
+  integration tests — no Docker daemon on this machine)
+- Frontend: **34 passed** (Vitest), `tsc --noEmit` clean, production build OK
 
-Key milestones delivered on `feature/workflow-evaluation-reporting` (Work Package D — Rahul):
-9. **Deterministic Workflow Engine**: LangGraph-compatible state machine (`add_node` / `add_conditional_edges` / `compile` / `invoke`) in `backend/app/workflow/graph.py` with cancellation, failure capture, and finalize-once guarantees — zero new dependencies; real LangGraph can slot in later without API changes.
-10. **Scenario Registry & Mock Agent Client**: three deterministic scenarios (`crm-read-customer-summary`, `crm-read-customer-hallucination`, `crm-read-customer-agent-failure`) with an idempotent seed CRM lead, plus a `SyntheticToolAgentClient` supporting correct/hallucinated/error/timeout behaviors.
-11. **Deterministic Evaluation**: weighted scoring (task 40 / factual 40 / trace 20), configurable `pass_threshold` (default 70), secret-leak detection, and the safety rule that any critical finding blocks a pass regardless of score.
-12. **Workflow Orchestration Service**: validate → verify environment → build scenario → invoke agent → evaluate → publish report → finalize, with a run-context registry, idempotent execution (queued-state guard), and a 30s total timeout.
-13. **Workflow API Surface (additive)**: `POST /api/v1/test-runs` auto-executes registered scenarios in the background (legacy `queued` behavior preserved for unknown/missing scenarios), plus `POST /api/v1/test-runs/{run_id}/execute` and `GET /api/v1/test-runs/{run_id}/report` exposing the rich `WorkflowReport`.
-14. **Automated Verification**: full backend suite **127 passing** (38 pre-existing + 89 Work Package D tests across engine, evaluation, security, service, API, and runtime modules), no API keys, no Docker, no network required.
-15. **Professional Audit & Hardening (post-review)**: three gaps found in a self-audit were fixed — (a) environment failures now publish a useful failed-run report (guide acceptance criterion), (b) an explicit `cleanup` node runs exactly once before finalize on **every** exit path (success, node failure, routing error, cancellation), and (c) secret-leak detection was extracted from `evaluator.py` into a separate, independently selectable `security_checks.py` module.
-16. **Second Audit Round (independent)**: a re-verification of all 11 guide requirements found and fixed four real defects — a false "langgraph already pinned" doc claim, a hardcoded (non-injectable) agent client, duplicated secret-key normalization, and an unhandled pre-finalize crash/timeout report boundary (now reports when a scenario exists, stays report-less when it doesn't). The `agent_client` seam is now injectable for Naaneshwar's `TargetAgent`. Full detail in [`docs/work-package-d-summary.md`](work-package-d-summary.md).
-17. **Launch Hardening (production-grade pass)**: new workflow-owned runtime layer (`backend/app/workflow/runtime.py`) adding structured logging, a **durable run-context store** that survives process restarts (atomic JSON snapshot, BOM/corruption tolerant), **settings-driven** operational config (`WORKFLOW_*` env vars), a concurrency limiter, process metrics, startup recovery of interrupted runs, context release on terminal states, and an additive `GET /api/v1/workflow/readiness` endpoint. Verified live, including a real restart that reloaded a durable context. A UTF-8 BOM reader bug was caught and fixed during that verification. See [`docs/work-package-d-summary.md`](work-package-d-summary.md) §9.
+**What Phase 3 added (all four work packages merged):**
+
+1. **WP-A (Naaneshwar) — target agents + API hardening**
+   - `TargetAgent` ABC + `MockTargetAgent` + thread-safe
+     `TargetAgentRegistry` (`backend/app/integrations/target_agents/`).
+     Any agent registered via `POST /agents` is immediately executable —
+     the registry resolves unknown ids to a mock built from the agent store.
+   - Agent-execution **service layer** (`app/services/agent_execution.py`)
+     extracted from the route (protocol parse → run/agent validation →
+     target-agent execution → traced event → protocol format). Route is a thin
+     HTTP mapping with a new optional `agent_id` query param (404 unknown).
+   - **Real API-key authentication**: `NEXORA_API_KEYS` +
+     `NEXORA_AUTH_MODE=auto|off|write|full`. Timing-safe comparison, standard
+     error envelope, synthetic sentinels honoured in every mode, health/schema
+     paths always open. Enforced in a pure-ASGI `AuthMiddleware` plus the
+     shared `authenticate_token()` in the route dependency.
+   - **Durable persistence**: the core store snapshots to
+     `NEXORA_STATE_DIR/store.json` (default `backend/.state/`) after every
+     mutation, with atomic writes and corruption-tolerant loading. A restarted
+     server keeps its data.
+   - **Middleware stack**: `ObservabilityMiddleware` (security headers +
+     structured request log, probes excluded) → CORS → `AuthMiddleware` → app;
+     all pure ASGI so SSE streaming passes through untouched.
+   - Synthetic-API **self-description** at `GET /api/v1/synthetic` (WP-C).
+
+2. **WP-B (Rajath) — synthetic environments**
+   - Docker-backed provisioning for postgres/mysql/mongodb/redis/neo4j/docker
+     with a full lifecycle (`provisioning → ready → stopped`, plus `reset`,
+     `destroy`). Without a Docker daemon the API correctly reports
+     `failed: "Docker Engine is unavailable"` (specified behaviour, not a bug).
+
+3. **WP-C (Prajwal) — synthetic API & adapters**
+   - Stateful synthetic CRM (`/api/v1/leads` CRUD), deterministic fault
+     injection (`simulated_latency_ms`, `inject_error`), three protocol
+     adapters (`rest`, `openai`, `langchain`), redacted tool-call tracing,
+     and the new `app/integrations/synthetic_api/` package (faults, lead
+     repository, capability descriptor router).
+
+4. **WP-D (Rahul) — workflow, evaluation, reports**
+   - Deterministic LangGraph-compatible engine, scenario registry, mock agent
+     client with injectable seam, weighted evaluator with configurable pass
+     threshold and critical-finding safety rule, orchestration service with
+     cancellation/timeouts/idempotency, durable run-context store with startup
+     recovery, and `GET /api/v1/workflow/readiness`.
+   - The dashboard drives real runs end-to-end: create run → live SSE trace
+     stream → evaluation report.
+
+**Launch-hardening added in this pass (on top of the four WPs):**
+- Real API-key auth (modes, timing-safe compare, sentinels) — §4
+- Durable core-store persistence (atomic, corruption-tolerant) — §5
+- Security headers + structured request logging — §4
+- Service-layer extraction for agent execution — §2
+- Target-agent abstraction with a registry and mock fallback — §2
+- Synthetic-API capability descriptor (`GET /api/v1/synthetic`) — §3
+- Frontend API-key support (`authHeaders()` across all fetch clients) — §6
+- CI workflow (`backend pytest` + `frontend typecheck/test/build`),
+  backend/frontend Dockerfiles, `docker-compose.yml` — §7
 
 ---
 
 ## 2. Service & Repository Status
 
-| Component | Path | Technology | Current Status |
+| Component | Path | Technology | Status |
 | :--- | :--- | :--- | :--- |
-| **Backend API** | [backend/](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/) | FastAPI + Python 3.13 | ✅ Active, verified, 38 passing tests; synthetic environments, stateful CRM, fault injection, protocol adapters (`rest`, `openai`, `langchain`), redacted tracing, execution-event integration, optional auth dependency, and SSE live trace streaming operational |
-| **Frontend UI** | [apps/web/](file:///c:/NEXORA-AI-TESTING-PLATFORM/apps/web/) | React + TypeScript + Vite | ✅ Dashboard scaffold extended with a real-time SSE trace viewer (`useTestRunStream` + `TraceStreamViewer`), 26 Vitest tests, and REST run selection; production build verified |
-| **Legacy/Node API** | [apps/api/](file:///c:/NEXORA-AI-TESTING-PLATFORM/apps/api/) | Node.js + Express | 🟡 Placeholder service retained for backward compatibility |
-| **Shared Lib** | [packages/shared/](file:///c:/NEXORA-AI-TESTING-PLATFORM/packages/shared/) | TypeScript | ✅ Common types and utilities retained |
-| **Documentation** | [docs/](file:///c:/NEXORA-AI-TESTING-PLATFORM/docs/) | Markdown | ✅ Architecture, API contracts, changes log, and current status fully updated |
+| **Backend API** | `backend/` | FastAPI + Python 3.12/3.13 | ✅ Canonical API (`:8000`). All `/api/v1` endpoints operational; auth, persistence, middleware, target agents, synthetic API, workflow engine live. 260 tests passing |
+| **Frontend UI** | `apps/web/` | React + TypeScript + Vite | ✅ Dashboard (`:3000`) drives real runs: create run, live SSE trace viewer, environment lifecycle, agent registration, API-key support. 34 tests passing, build clean |
+| **Legacy/Node API** | `apps/api/` | Node.js + Express | 🟡 Placeholder retained for compatibility; **not** the canonical backend |
+| **Shared Lib** | `packages/shared/` | TypeScript | ✅ Shared types/utilities |
+| **Docs** | `docs/` | Markdown | ✅ Architecture, API contract, this status file |
+| **CI/CD** | `.github/workflows/ci.yml` | GitHub Actions | ✅ Backend pytest + frontend typecheck/test/build on push/PR |
+| **Containers** | `backend/Dockerfile`, `apps/web/Dockerfile`, `docker-compose.yml` | Docker + nginx | ✅ Non-root images with health checks; `docker compose up --build` runs the stack |
 
 ---
 
-## 3. API Endpoints & Contract Implementation Status
+## 3. API Surface (OpenAPI/Swagger at `/docs`)
 
-All endpoints are versioned under `/api/v1` (except the root `/health` ping) using standard `ApiEnvelope` packaging:
+All endpoints are versioned under `/api/v1` (except root `/health` and the
+OpenAI-compatible `/v1/*` routes) and use the standard `ApiEnvelope`
+packaging `{"success", "data", "error"}`.
 
-| Domain | Route | Method | Status | Notes |
-| :--- | :--- | :--- | :--- | :--- |
-| **Health** | `/api/v1/health` | `GET` | ✅ Operational | Baseline status and service health check |
-| **Root Health**| `/health` | `GET` | ✅ Operational | Lightweight service ping |
-| **Agents** | `/api/v1/agents` | `POST` | ✅ Operational | Registers agent configuration; enforces `409 Conflict` on duplicates |
-| **Agents** | `/api/v1/agents/{agent_id}` | `GET` | ✅ Operational | Inspects registered agent details |
-| **Environments**| `/api/v1/environments` | `POST` | ✅ Operational | Provisions synthetic environment (`status: provisioning`) |
-| **Environments**| `/api/v1/environments/{environment_id}` | `GET` | ✅ Operational | Fetches environment status and endpoint |
-| **Environments**| `/api/v1/environments/{environment_id}/ready` | `POST` | ✅ Operational | Transitions status from `provisioning` to `ready` |
-| **Environments**| `/api/v1/environments/{environment_id}/stop` | `POST` | ✅ Operational | Transitions status to `stopped` |
-| **Test Runs** | `/api/v1/test-runs` | `POST` | ✅ Operational | Queues scenario test run |
-| **Test Runs** | `/api/v1/test-runs/{run_id}` | `GET` | ✅ Operational | Fetches execution state |
-| **Test Runs** | `/api/v1/test-runs/{run_id}/cancel` | `POST` | ✅ Operational | Cancels active run |
-| **Test Runs** | `/api/v1/test-runs/{run_id}/execute` | `POST` | ✅ Operational | (WP-D) Executes a queued run with a registered scenario; `404` unknown run, `409` non-queued run or unregistered scenario (lists registered ids) |
-| **Workflow Reports** | `/api/v1/test-runs/{run_id}/report` | `GET` | ✅ Operational | (WP-D) Rich `WorkflowReport`: weighted criteria, findings, evidence, threshold; `404` when no report exists |
-| **Events** | `/api/v1/test-runs/{run_id}/events` | `GET` | ✅ Operational | Retrieves tool-call execution events |
-| **Traces** | `/api/v1/test-runs/{run_id}/traces` | `GET` | ✅ Operational | Retrieves redacted tool-call execution traces (`ToolCallTraceResponse`) |
-| **Streaming** | `/api/v1/test-runs/{run_id}/stream` | `GET` | ✅ Operational | Server-Sent Events stream of `tool_trace` frames plus a terminal `run_status` frame (`EventSourceResponse`); `404` for unknown runs |
-| **Evaluations** | `/api/v1/evaluations` | `POST` | ✅ Operational | Submits evaluation result and generates report |
-| **Reports** | `/api/v1/reports/{report_id}` | `GET` | ✅ Operational | Retrieves final evaluation report |
-| **CRM Leads** | `/api/v1/leads` | `POST` | ✅ Operational | Creates new CRM lead (`status: 201`, validates name/email/status) |
-| **CRM Leads** | `/api/v1/leads` | `GET` | ✅ Operational | Lists all leads; supports `simulated_latency_ms` & `inject_error` |
-| **CRM Leads** | `/api/v1/leads/{lead_id}` | `GET` | ✅ Operational | Retrieves specific lead (`404` if missing); supports fault injection |
-| **CRM Leads** | `/api/v1/leads/{lead_id}` | `PUT` | ✅ Operational | Updates existing lead fields (`404` if missing) |
-| **CRM Leads** | `/api/v1/leads/{lead_id}` | `DELETE` | ✅ Operational | Deletes CRM lead by ID (`status: 204`, `404` if missing) |
-| **Synthetic Agent** | `/api/v1/synthetic/agent/execute/{protocol}` | `POST` | ✅ Operational | Protocol-agnostic tool dispatcher (`rest`, `openai`, `langchain`); normalizes requests/responses and attaches traces when `run_id` is supplied |
-
----
-
-## 4. Synthetic Architecture & Implementation Details
-
-- **CRM Schemas**: [`backend/app/schemas/crm.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/schemas/crm.py)
-  - `CRMLeadCreate`: Field validation for `name` (`min_length=2, max_length=100`), `email`, optional `company`, and `status` (`new`, `contacted`, `qualified`, `closed`).
-  - `CRMLeadResponse`: Extends `CRMLeadCreate` with `id`, `created_at`, and `updated_at`.
-- **In-Memory Store**: [`backend/app/core/store.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/core/store.py)
-  - State dictionaries: `ENVIRONMENTS`, `AGENTS`, `TEST_RUNS`, `EVENTS`, `CRM_LEADS`, `TOOL_TRACES`, `REPORTS`.
-  - Full CRUD operations with timestamp tracking, `get_events_for_run` / `record_execution_event` helpers, and singleton instance `store = Store()`.
-- **Fault Simulation & Resiliency**: [`backend/app/api/routes/crm.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/api/routes/crm.py)
-  - `SimulatedLatencyMs`: `Query(ge=0, le=60000)` non-blocking delay via `asyncio.sleep`.
-  - `InjectError`: `Query(ge=400, le=599)` simulates HTTP status codes (e.g., `429`, `500`).
-  - Strict range validation rejecting out-of-range values with `422 Unprocessable Entity`.
-  - Faults are evaluated before store operations, guaranteeing zero data corruption.
-- **Protocol Adapter Layer**: [`backend/app/core/adapters.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/core/adapters.py)
-  - Unified models `AgentToolRequest` and `AgentToolResponse`.
-  - `BaseProtocolAdapter` contract implemented by `RESTProtocolAdapter` and `OpenAIFunctionAdapter`.
-  - `AdapterFactory` dynamically resolves adapters with support for aliases (`openai_function`, `function`, `langchain`).
-- **Synthetic Tool Registry**: [`backend/app/core/tools.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/core/tools.py)
-  - Maps tool names and dotted aliases (`list_crm_leads`, `crm.list_leads`, etc.) to store operations.
-- **Execution Dispatcher**: [`backend/app/api/routes/agent_execution.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/api/routes/agent_execution.py)
-  - `POST /api/v1/synthetic/agent/execute/{protocol}` parses via adapter, executes tool, captures timing, attaches telemetry to test runs, and emits a redacted `tool_call` execution event when `run_id` is supplied.
-- **Sensitive Data Redaction**: [`backend/app/core/redaction.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/core/redaction.py)
-  - `redact_sensitive_data()` recursively scrubs sensitive dictionary keys (`password`, `token`, `api_key`, `secret`, `authorization`, etc.) and inline regex patterns (Bearer tokens, AWS keys, JWTs, OpenAI keys).
-- **Tool-Call Telemetry**: [`backend/app/core/telemetry.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/core/telemetry.py)
-  - `execute_and_trace_tool()` times execution via `time.perf_counter()`, applies redaction, and records traces into `TOOL_TRACES`.
-- **Optional Authentication**: [`backend/app/core/auth.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/core/auth.py)
-  - `verify_optional_auth()` is a reusable FastAPI dependency backed by `APIKeyHeader(name="X-API-Key", auto_error=False)` and `HTTPBearer(auto_error=False)`, so anonymous callers are never rejected.
-  - Accepts either credential (Bearer takes precedence) and reports `{"authenticated": bool, "token_prefix": …}`.
-  - Deterministic denied-access sentinels: `invalid-token-test` → `401 Unauthorized`, `forbidden-token-test` → `403 Forbidden`, both using the standard `{"message": ...}` error envelope.
-  - Attached via `Depends(verify_optional_auth)` to all `/api/v1/leads` endpoints ([`crm.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/api/routes/crm.py)), to `POST /api/v1/synthetic/agent/execute/{protocol}` ([`agent_execution.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/api/routes/agent_execution.py)), and to the SSE stream route; sentinels are rejected before any handler logic runs.
-- **SSE Live Trace Streaming**: [`backend/app/api/routes/streaming.py`](file:///c:/NEXORA-AI-TESTING-PLATFORM/backend/app/api/routes/streaming.py)
-  - `GET /api/v1/test-runs/{run_id}/stream` returns an `EventSourceResponse`; unknown runs get a structured `404` before the stream opens.
-  - Polls `get_traces_for_run(run_id)` every 1s and emits `tool_trace` frames, de-duplicated by a stable `call_id:timestamp` key (also the SSE `id`).
-  - Emits a terminal `run_status` frame (`run_id`, `state`, `message`, `completed_at`) and closes on `completed` / `failed` / `cancelled` / `passed`, or when `request.is_disconnected()`.
+| Domain | Route | Method | Notes |
+| :--- | :--- | :--- | :--- |
+| Health | `/api/v1/health`, `/health` | `GET` | Service health (open in every auth mode) |
+| Agents | `/api/v1/agents` | `POST` | Register a target agent; `409` on duplicates |
+| Agents | `/api/v1/agents/{agent_id}` | `GET` | Inspect a registered agent |
+| Test Runs | `/api/v1/test-runs` | `POST` | Create + auto-execute registered scenarios (unknown scenarios stay `queued`) |
+| Test Runs | `/api/v1/test-runs/{run_id}` | `GET` | Run status |
+| Test Runs | `/api/v1/test-runs/{run_id}/cancel` | `POST` | Cancel an active run |
+| Test Runs | `/api/v1/test-runs/{run_id}/execute` | `POST` | Execute a queued run (`404` unknown, `409` non-queued) |
+| Test Runs | `/api/v1/test-runs/{run_id}/events` | `GET` | Execution timeline |
+| Test Runs | `/api/v1/test-runs/{run_id}/traces` | `GET` | **Redacted** tool-call traces |
+| Test Runs | `/api/v1/test-runs/{run_id}/report` | `GET` | Rich `WorkflowReport` (criteria, findings, threshold) |
+| Test Runs | `/api/v1/test-runs/{run_id}/stream` | `GET` | **SSE** live trace stream (`tool_trace` + terminal `run_status`) |
+| Environments | `/api/v1/environments` | `POST` | Provision a synthetic environment |
+| Environments | `/api/v1/environments/{id}` | `GET` | Environment status |
+| Environments | `/api/v1/environments/{id}/ready\|stop\|reset\|destroy` | `POST` | Lifecycle transitions |
+| Evaluations | `/api/v1/evaluations` | `POST` | Submit an evaluation, generate a report |
+| Reports | `/api/v1/reports/{report_id}` | `GET` | Fetch an evaluation report |
+| CRM Leads | `/api/v1/leads` | `POST` | Create lead (`201`) |
+| CRM Leads | `/api/v1/leads` | `GET` | List leads; fault injection via `simulated_latency_ms` / `inject_error` |
+| CRM Leads | `/api/v1/leads/{lead_id}` | `GET`/`PUT`/`DELETE` | Read / full replace / delete (`404` when missing) |
+| Synthetic Agent | `/api/v1/synthetic/agent/execute/{protocol}` | `POST` | Protocol dispatcher (`rest`, `openai`, `langchain`); optional `run_id` (tracing) and `agent_id` (target agent, `404` unknown) |
+| Synthetic API | `/api/v1/synthetic` | `GET` | **Self-description**: protocols, tools, fault ranges, auth mode, redaction contract |
+| Synthetic API | `/api/v1/synthetic/tools` | `GET` | Tool registry |
+| Workflow | `/api/v1/workflow/readiness` | `GET` | Engine readiness + process metrics |
+| OpenAI-compat | `/v1/models`, `/v1/health` | `GET` | OpenAI-compatible discovery/health |
 
 ---
 
-## 5. Testing & Verification Status
+## 4. Authentication (WP-A launch hardening)
 
-### Automated Pytest Suite
-- **Command**: `python -m pytest` (system Python 3.13 on this branch; no venv required)
-- **Result**: **`127 passed`** in ~1.4s
-  - Pre-existing Phase 2/3 baseline (38 tests): `test_api_contracts.py` (4), `test_health.py` (1), `test_protocol_adapters.py` (7), `test_tracing.py` (8), `test_crm.py` (5), `test_auth.py` (9), `test_streaming.py` (4).
-  - Work Package D additions (89 tests):
-    - `tests/test_workflow_engine.py` (13): node execution order, conditional edges, cancellation propagation, failure capture, finalize-once semantics, invoke determinism, **cleanup-runs-exactly-once on success/failure/cancellation paths**, cleanup definition validation.
-    - `tests/test_workflow_evaluation.py` (16): weighted scoring, threshold configuration/validation, hallucination detection, secret-leak detection, critical-finding safety rule, pass/fail determinism.
-    - `tests/test_security_checks.py` (6): standalone security evaluator — sensitive/aliased key extraction, detection across traces/summary/record, non-sensitive variables never flagged, critical `secret_exposure` severity, evaluator re-export compatibility.
-    - `tests/test_workflow_service.py` (25): environment verification (**incl. failed-run report publication**), scenario build, idempotent execution, run-context registry, invalid-config failures (report-less by contract), report publishing, timeouts, **pre-finalize crash/timeout report boundary**, cancellation, **cleanup event on success and failure paths**, **injectable agent client seam**.
-    - `tests/test_workflow_api.py` (14): auto-execution contract compatibility, manual execute (200/404/409), report endpoint (200/404), Phase 2 `ReportSummary` projection, secret canary absence over HTTP, agent-failure and invalid-threshold HTTP paths, full pass+fail demo flow **incl. the environment-failure report**.
-    - `tests/test_workflow_runtime.py` (15): structured-logging configuration, durable run-context store (reload after restart, atomic write, pop, BOM tolerance, corruption tolerance, unexpected-shape tolerance), concurrency limiter bounding, metrics counters, readiness snapshot, startup recovery (terminalizes stuck runs, idempotent).
-  - Baseline test names are retained in each pre-existing module docstring; all 38 baseline tests remain unmodified and green.
+Configuration (`backend/app/core/auth.py`, `app/core/middleware.py`):
 
-### Frontend Vitest Suite (`apps/web`)
-- **Command**: `npm test --workspace @nexora/web` (Vitest 5 + jsdom + Testing Library)
-- **Result**: **`26 passed`** (2 files)
-  - `src/hooks/useTestRunStream.test.tsx` (14 passed): idle without a run, connecting → connected transition, trace append, success/failure traces, non-terminal vs terminal `run_status` (stream close), malformed payload tolerance, de-duplication, transient → reconnecting → recovery, fatal error, run-id switch reset, cleared run, unmount cleanup.
-  - `src/components/TraceStreamViewer.test.tsx` (12 passed): no-run empty state, connecting state, trace rendering (name/call id/duration), run-status updates, success/failure labels, REST status seeding, malformed payload tolerance, fatal error alert, reconnect → recover, run-id switch, sensitive-value redaction, long tool names.
-- **Type check**: `npm run lint --workspace @nexora/web` (`tsc --noEmit`) passes.
-- **Build**: `npm run build --workspace @nexora/web` (`tsc --noEmit && vite build`) succeeds (21 modules; `dist/assets/index-*.js` ~152.8 kB / 49.9 kB gzip).
-- **Limitation**: the viewer is verified with a mocked `EventSource` (jsdom has no SSE); the browser-to-backend path is covered indirectly by the backend `tests/test_streaming.py` SSE contract tests.
+- `NEXORA_API_KEYS` — comma-separated accepted keys (empty ⇒ auth off).
+- `NEXORA_AUTH_MODE` — `auto` (default: `write` when keys exist, else `off`),
+  `off`, `write` (mutations require a key; **reads stay open** so the
+  dashboard, Swagger and SSE keep working), `full` (everything requires a key).
+  An explicit `write`/`full` with no keys degrades to `off` with a startup
+  warning instead of locking everyone out.
+- Credentials accepted via `X-API-Key` or `Authorization: Bearer`
+  (Bearer wins when both are present); comparison is **timing-safe**
+  (`secrets.compare_digest` over every configured key).
+- Synthetic sentinels honoured in every mode: `invalid-token-test` → 401,
+  `forbidden-token-test` → 403.
+- Always-open paths: `/health`, `/api/v1/health`, `/v1/health`, `/v1/models`,
+  `/docs`, `/redoc`, `/openapi.json`.
+- Enforcement is duplicated at the edge (`AuthMiddleware`, standard error
+  envelope) and in the route dependency (`verify_optional_auth`) so a route
+  behaves identically with or without the middleware.
 
-### Live Verification Cycles
-1. **Synthetic Environment Lifecycle**: Verified `POST /environments` (`provisioning`) → `POST /environments/{id}/ready` (`ready`) → `POST /environments/{id}/stop` (`stopped`).
-2. **Synthetic CRM Leads Lifecycle**: Verified `POST /leads` (201) → `GET /leads/{id}` (200) → `PUT /leads/{id}` (200) → `DELETE /leads/{id}` (204) → `GET /leads/{id}` (404).
-3. **Fault Simulation & Resiliency**: Verified `GET /leads?simulated_latency_ms=10` (200 delay), `GET /leads?inject_error=429` (429 status), `GET /leads?inject_error=200` (422 validation failure).
-4. **Protocol Adapter Execution**: Verified `POST /synthetic/agent/execute/rest` and `POST /synthetic/agent/execute/openai` with function payloads.
-5. **Tool-Call Tracing & Secret Redaction**: Verified `POST /synthetic/agent/execute/rest?run_id={run_id}` with secret parameter `api_key`; confirmed `GET /test-runs/{run_id}/traces` returns `api_key == "[REDACTED]"` with UTC timestamp, and `GET /test-runs/{run_id}/events` returns the linked `tool_call` event with the redacted payload.
-6. **Optional Authentication**: Verified anonymous (`authenticated: false`), `X-API-Key` and `Bearer` acceptance with token prefixes, Bearer precedence over the API key, and simulated `401` / `403` denied-access responses via the synthetic sentinels — both on an isolated probe route and on the real `/api/v1/leads` and `/api/v1/synthetic/agent/execute/{protocol}` routers.
-7. **SSE Live Trace Streaming**: Verified `GET /test-runs/{run_id}/stream` returns `404` for unknown runs, streams exactly one deduplicated `tool_trace` frame (redacted payload) followed by a terminal `run_status` frame with `"state": "cancelled"` for a cancelled run, and rejects the forbidden sentinel with `403`.
-8. **Work Package D Full Demo (live uvicorn, C8 checkpoint)**: Verified over real HTTP on `127.0.0.1:8000`: health → agent registration → environment creation → run bound to a `provisioning` environment fails safely with a clear message → `POST /environments/{id}/ready` → passing run reaches `passed` with a 100.00 score report → `crm-read-customer-hallucination` run fails with score 60.00 and a `critical/unsupported_fact` finding citing `platinum-vip` → secret canary supplied via `scenario.variables` absent from traces (replaced by `[REDACTED]`) → unknown scenario `"browser regression"` remains `queued`. Server logs showed no 500s, no tracebacks, and no secret material.
-9. **Work Package D Launch Verification (live uvicorn)**: Verified `GET /api/v1/workflow/readiness` (`ready: true`, state path, metrics); a happy-path run (`passed`, metrics move); **restart recovery** (a durable run-context written before a restart was reloaded by a fresh process — a UTF-8 BOM reader bug was found and fixed here); **env-config wiring** (`WORKFLOW_STATE_DIR` and `WORKFLOW_DEFAULT_PASS_THRESHOLD=95` honored, with `95.0` appearing in the persisted `WorkflowReport.pass_threshold`); and a 5-run burst all reaching terminal state under the concurrency limit with contexts released afterwards.
+**Known limitation:** the browser's `EventSource` cannot send headers, so the
+SSE stream relies on reads staying open — `write` mode (effective whenever
+keys are configured with `auto`) is the recommended production config. `full`
+mode breaks dashboard streaming by design.
+
+**Frontend:** `apps/web/src/api/auth.ts` resolves a key from `sessionStorage`
+(`nexora_api_key`) or build-time `VITE_API_KEY` and spreads `X-API-Key` into
+every mutating fetch. A token never appears in a URL.
 
 ---
 
-## 6. Team Next Steps & Upcoming Work
+## 5. Durable Persistence (WP-A launch hardening)
 
-- **Prajwal (Simulation & Profiling)**:
-  - ✅ Protocol adapter layer (`REST`, OpenAI/LangChain) with execution dispatcher delivered.
-  - ✅ Tool-call tracing with sensitive-data redaction delivered (`/test-runs/{run_id}/traces`).
-  - ✅ Execution-event integration for profiled tool calls and focused CRM contract coverage delivered (`tests/test_crm.py`, 5 tests).
-  - ✅ SSE live trace streaming delivered (`GET /api/v1/test-runs/{run_id}/stream`; 4 tests in `tests/test_streaming.py`).
-  - ✅ SSE stream wired into the dashboard client: `useTestRunStream` hook + `TraceStreamViewer` component, run selection/creation via the REST client, 26 Vitest tests.
-  - Next: Add additional adapters (Anthropic tool use, MCP tool schema execution) and add a browser-level end-to-end check for the live stream.
-- **Rajath (Provisioning & Infrastructure)**:
-  - Connect Docker Engine container lifecycle management for real PostgreSQL, MySQL, and MongoDB synthetic environments.
-- **Naaneshwar (Integrations & Service Layer)**:
-  - ✅ Optional authentication dependency delivered (`backend/app/core/auth.py`): accepts `X-API-Key` / `Authorization: Bearer`, supports simulated 401/403 denial, 9 contract tests (`tests/test_auth.py`; 34 tests total).
-  - ✅ Dependency attached to all `/api/v1/leads` routes and `POST /api/v1/synthetic/agent/execute/{protocol}` via `Depends(verify_optional_auth)`; anonymous traffic still flows, sentinels return 401/403.
-  - Next: Extend the dependency to the remaining routers (agents, test runs, environments) and enforce real API keys instead of the synthetic sentinels.
-  - Transition backend store from in-memory dictionary to persistent storage (PostgreSQL / Redis).
-- **Rahul (Workflows & Evaluation)**:
-  - ✅ Work Package D delivered on `feature/workflow-evaluation-reporting`: deterministic LangGraph-compatible workflow engine, scenario registry + mock agent client, weighted evaluator with configurable threshold and critical-finding safety rule, orchestration service with cancellation/timeouts/idempotency, and additive API surface (`POST /test-runs/{id}/execute`, `GET /test-runs/{id}/report`, background auto-execution of registered scenarios).
-  - ✅ 127 backend tests passing (89 new); live HTTP demo of the full pass/fail/redaction flow verified; no secrets in traces, reports, or logs.
-  - ✅ Post-audit hardening: environment-failure reports, explicit cleanup node on all exit paths, and a standalone `security_checks` module (see [`docs/work-package-d-summary.md`](work-package-d-summary.md)).
-  - ✅ Second independent audit round: fixed a false dependency doc claim, made the agent client injectable for Naaneshwar's `TargetAgent`, de-duplicated secret-key normalization, and pinned the pre-finalize crash/timeout report boundary with tests.
-  - ✅ **Launch hardening**: structured logging, durable restart-surviving run-context store, settings-driven config, concurrency limiter, process metrics, startup recovery, and additive `GET /api/v1/workflow/readiness`. Verified live including a real restart that reloaded a durable context (and surfaced a UTF-8 BOM reader bug, now fixed).
-  - Next: team review of the additive `store.py` helpers (lead-owned file), then optionally swap the in-repo state machine for real LangGraph (not currently a declared dependency — deliberate zero-dependency choice; pin `langgraph` in `backend/requirements.txt` first) and wire live LLM agent providers by injecting a `WorkflowAgentClient` implementation into `WorkflowRunExecutor`.\n  - The `agent_client` constructor argument is the ready-made integration seam for Naaneshwar's `TargetAgent` interface — no service changes needed when that lands.
+`backend/app/core/persistence.py` snapshots the whole core store
+(`AGENTS`, `TEST_RUNS`, `ENVIRONMENTS`, `EVENTS`, `REPORTS`, `TOOL_TRACES`,
+`WORKFLOW_REPORTS`, `CRM_LEADS`) to `NEXORA_STATE_DIR/store.json` (default
+`backend/.state/`) after every mutation and rehydrates at startup.
+
+- **Atomic**: temp-file + `os.replace`; a crash mid-write never corrupts the
+  last good snapshot.
+- **Corruption tolerant**: an unreadable/malformed snapshot is logged and
+  skipped — the process starts empty instead of crashing. Invalid individual
+  records are skipped without dropping the rest.
+- **Opt-out, not opt-in**: enabled by default; `NEXORA_STATE_DIR=""` disables
+  it. `tests/conftest.py` disables it at import time plus an autouse fixture
+  so the suite stays hermetic.
+- The workflow subsystem keeps its own durable run-context store
+  (`WORKFLOW_STATE_DIR`) with startup recovery of interrupted runs.
+
+---
+
+## 6. Frontend Status
+
+`apps/web/` is a four-tab dashboard (Runs, Agents, Environments, Workflow)
+driving the live backend:
+
+- **Runs**: create a test run (bound to the built-in deterministic scenario),
+  live SSE trace stream (`useTestRunStream` + `TraceStreamViewer`), cancel,
+  report view.
+- **Agents**: register/list agents (registration makes them executable).
+- **Environments**: create + lifecycle (`ready`/`stop`/`reset`/`destroy`).
+- **Workflow**: readiness metrics from `/api/v1/workflow/readiness`.
+- API-key aware via `authHeaders()`; error surfaces use the standard envelope.
+
+**Verification:** 34 Vitest tests pass (4 files, incl. 4 new auth tests),
+`npx tsc --noEmit` clean, `npm run build` succeeds (~165 kB JS / 52 kB gzip).
+
+---
+
+## 7. CI, Containers & Configuration
+
+- **CI** (`.github/workflows/ci.yml`): backend job (pip install + pytest) and
+  frontend job (npm install at workspace root + tsc + vitest + vite build).
+- **Backend image** (`backend/Dockerfile`): `python:3.12-slim`, non-root,
+  `/data/state` volume for persistence, health check on `/health`.
+- **Frontend image** (`apps/web/Dockerfile`): node build stage → nginx serve
+  stage with SPA fallback (`nginx.conf`).
+- **Compose** (`docker-compose.yml`): backend `:8000` + web `:3000`, named
+  volume for the store, optional `docker_provisioning` profile that mounts the
+  Docker socket for live environment provisioning.
+- **Configuration**: see `.env.example` — `NEXORA_API_KEYS`,
+  `NEXORA_AUTH_MODE`, `NEXORA_STATE_DIR`, `CORS_ORIGINS`, `WORKFLOW_*`,
+  `VITE_API_BASE_URL`, `VITE_API_KEY`.
+
+---
+
+## 8. Testing & Verification
+
+### Backend (`cd backend && .venv/Scripts/python -m pytest -q`)
+**260 passed, 3 skipped** (~6s). The 3 skips are Docker-gated live
+integration tests (`pytest.mark.docker`) that auto-skip without a daemon.
+
+New coverage added in this pass (79 tests across 6 files):
+- `test_persistence.py` (16): round-trip of every collection, atomic writes,
+  corruption/shape/BOM tolerance, invalid-record skipping, disable semantics,
+  and an HTTP restart cycle proving data survives a "process restart".
+- `test_auth_enforcement.py` (17): mode resolution, timing-safe key matching,
+  401/403 envelopes, reads-open in write mode, sentinels in every mode,
+  health/schema always open.
+- `test_middleware.py` (9): security headers on success/404/422/preflight,
+  request logging with probes excluded, error-envelope shape.
+- `test_target_agents.py` (15): ABC contract, mock execution, tracing +
+  redaction, registry semantics, store-agent resolution, unknown-id errors.
+- `test_agent_execution_service.py` (18): service-level protocol/run/agent
+  validation, event recording, redaction, plus HTTP status mapping.
+- `test_synthetic_api.py` (13): capability descriptor, repository CRUD,
+  fault-injection contract and validation.
+
+### Frontend (`cd apps/web && npm run test`)
+**34 passed** (4 files). Typecheck and production build clean.
+
+### Live verification (this pass)
+- Full endpoint smoke: env lifecycle, runs/reports/traces/events, CRM
+  CRUD + 422/404, 3 protocol adapters, fault injection (429), auth sentinels
+  (401/403), secret redaction, failure scenario (hallucination → score 60,
+  fail), SSE (`tool_trace` + `run_status` frames).
+- Dashboard driven end-to-end in a real browser with zero console errors.
+- Swagger UI at `/docs` lists every route above.
+
+---
+
+## 9. Remaining Work (documented, not blockers)
+
+1. **Real target-agent providers** — the `TargetAgent` ABC + registry +
+   `agent_client` seam are ready; implement an OpenAI/Anthropic/etc. agent
+   class and register it. Workflow execution currently runs the deterministic
+   mock.
+2. **Docker-backed environment provisioning** — code and SDK integration are
+   complete; requires a host with a Docker daemon (or the compose
+   `docker_provisioning` profile). Verified to fail gracefully without one.
+3. **PostgreSQL/Redis store swap** — `core/persistence.py` is the seam for a
+   real database; today it is a durable JSON snapshot.
+4. **Browser-level SSE e2e test** — covered by backend contract tests and
+   manual browser verification; an automated browser e2e remains.
+5. **Deployment automation** — CI runs tests/builds; image publishing and
+   environment-specific deploy pipelines are not yet wired.
+6. **Additional adapters** — Anthropic tool-use and MCP tool-schema adapters
+   alongside `rest`/`openai`/`langchain`.

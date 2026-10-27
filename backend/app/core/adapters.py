@@ -169,6 +169,11 @@ class AdapterFactory:
             )
         return adapter_cls()
 
+    @classmethod
+    def supported_protocols(cls) -> list[str]:
+        """Every registered protocol name (used by the capability descriptor)."""
+        return sorted(cls._registry)
+
 
 AdapterFactory.register("rest", RESTProtocolAdapter)
 AdapterFactory.register("openai", OpenAIFunctionAdapter)

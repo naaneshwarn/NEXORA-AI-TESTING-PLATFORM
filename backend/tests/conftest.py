@@ -44,6 +44,28 @@ if str(_BACKEND) not in sys.path:
 
 
 # --------------------------------------------------------------------------- #
+# Work Package A — hermetic core-store persistence                             #
+# --------------------------------------------------------------------------- #
+# Persistence is enabled by default in real runs (``.state/store.json``) so a
+# restarted server keeps its data.  Tests must never read or write that file:
+# disable it *at conftest import time* (before any app lifespan can configure
+# it) and re-assert it around every test so a persistence test that forgets to
+# clean up cannot leak durability into later tests.  ``test_persistence.py``
+# opts back in explicitly with its own temporary directory.
+from app.core.config import settings as _settings  # noqa: E402
+
+_settings.state_dir = ""
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_store_persistence():
+    """Guarantee store persistence stays off for the duration of each test."""
+    _settings.state_dir = ""
+    yield
+    _settings.state_dir = ""
+
+
+# --------------------------------------------------------------------------- #
 # Work Package B — Docker-free environment manager                             #
 # --------------------------------------------------------------------------- #
 class _NoopDockerProvider:

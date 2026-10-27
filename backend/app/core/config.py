@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -18,6 +18,37 @@ class Settings(BaseSettings):
     port: int = Field(default=8000)
     log_level: str = Field(default="INFO")
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:3000", "http://localhost:5173"])
+
+    # -- Authentication (Naaneshwar / WP-A launch hardening) ---------------
+    # Comma-separated list of accepted API keys (NEXORA_API_KEYS).  Empty by
+    # default so local development and the test suite stay credential-free;
+    # set it to turn authentication on for a deployment.  The NEXORA_-prefixed
+    # env var is the documented name (see .env.example); the bare field name
+    # (API_KEYS) is accepted as a fallback alias.
+    api_keys: str = Field(
+        default="",
+        validation_alias=AliasChoices("NEXORA_API_KEYS", "API_KEYS"),
+    )
+    # Authentication enforcement mode (NEXORA_AUTH_MODE / AUTH_MODE):
+    #   auto  - "write" when api_keys are configured, otherwise "off"
+    #   off   - never enforce (sentinels still simulate 401/403)
+    #   write - mutating requests (POST/PUT/PATCH/DELETE) require a valid key
+    #   full  - every request under the API prefix requires a valid key
+    # Reads stay open in "write" mode so the dashboard, Swagger UI and the SSE
+    # trace stream keep working without embedding credentials in URLs.
+    auth_mode: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("NEXORA_AUTH_MODE", "AUTH_MODE"),
+    )
+
+    # -- Durable core-store persistence (WP-A) ----------------------------
+    # Directory for the JSON snapshot of the core store (agents, runs,
+    # environments, leads, traces, reports).  Relative paths resolve against
+    # the backend directory.  Set to an empty string to disable persistence.
+    state_dir: str = Field(
+        default=".state",
+        validation_alias=AliasChoices("NEXORA_STATE_DIR", "STATE_DIR"),
+    )
 
     # -- Workflow execution (Rahul / Work Package D) -----------------------
     # Operational knobs for the workflow subsystem.  All are environment

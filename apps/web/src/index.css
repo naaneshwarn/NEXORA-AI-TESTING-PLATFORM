@@ -391,3 +391,162 @@ th {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* --- Dashboard additions (Phase 3 shell) --- */
+
+.tab-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 26px;
+}
+
+.tab-bar .primary-button,
+.tab-bar .secondary-button {
+  text-transform: capitalize;
+}
+
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
+}
+
+.status-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 16px;
+  border-radius: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(7, 20, 33, 0.7);
+}
+
+.status-card strong {
+  font-size: 0.98rem;
+}
+
+.status-card span {
+  color: #9cc2d8;
+  font-size: 0.86rem;
+}
+
+.status-card code {
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  font-size: 0.74rem;
+  color: #80d0ff;
+  overflow-wrap: anywhere;
+}
+
+.status-ok {
+  border-color: rgba(34, 197, 94, 0.35);
+  box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.08);
+}
+
+.status-warn {
+  border-color: rgba(239, 68, 68, 0.4);
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Inputs inside a vertical .field must not inherit the horizontal
+   .run-picker-controls flex-basis (220px would become their height). */
+.field .run-input {
+  flex: 0 1 auto;
+  width: 100%;
+  height: auto;
+}
+
+.field > span,
+.field-label {
+  color: #9cc2d8;
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 6px;
+}
+
+.empty-state {
+  color: #9cc2d8;
+  margin: 0;
+  padding: 6px 0;
+}
+
+.row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.row-actions .secondary-button {
+  padding: 0.5rem 0.9rem;
+  font-size: 0.85rem;
+}
+
+.env-meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 14px;
+  margin: 0 0 4px;
+}
+
+.env-meta dt {
+  color: #9cc2d8;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.env-meta dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.lifecycle-log {
+  margin: 0;
+  padding: 0 0 0 20px;
+  max-height: 240px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lifecycle-log li {
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  font-size: 0.8rem;
+  color: #bfe3ff;
+  overflow-wrap: anywhere;
+}
+
+.agent-registered {
+  margin: 14px 0 0;
+  color: #22c55e;
+}
+
+.agent-registered code {
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+
+@media (max-width: 720px) {
+  .topbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+}
